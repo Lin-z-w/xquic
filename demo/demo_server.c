@@ -157,6 +157,9 @@ typedef struct xqc_demo_svr_env_config_s {
 
     /* bandwidth report interval (seconds), 0 means disabled */
     int     report_interval;
+
+    /* iperf output file */
+    char    iperf_output_file[PATH_LEN];
 } xqc_demo_svr_env_config_t;
 
 
@@ -1349,6 +1352,7 @@ xqc_demo_svr_usage(int argc, char *argv[])
             "   -u    Keyupdate packet threshold\n"
             "   -F    MTU size (default: 1200)\n"
             "   -j    Bandwidth report interval in seconds (default: 1, 0 to disable)\n"
+            "   -J    iperf output file path (default: server_iperf_output.csv)\n"
             , prog);
 }
 
@@ -1385,6 +1389,7 @@ xqc_demo_svr_init_args(xqc_demo_svr_args_t *args)
     strncpy(args->env_cfg.priv_key_path, PRIV_KEY_PATH, PATH_LEN - 1);
     strncpy(args->env_cfg.cert_pem_path, CERT_PEM_PATH, PATH_LEN - 1);
     args->env_cfg.report_interval = 1;
+    strncpy(args->env_cfg.iperf_output_file, "server_iperf_output.csv", sizeof(args->env_cfg.iperf_output_file) - 1);
 
     args->quic_cfg.keyupdate_pkt_threshold = UINT64_MAX;
     args->quic_cfg.least_available_cid_count = 1;
@@ -1395,7 +1400,7 @@ void
 xqc_demo_svr_parse_args(int argc, char *argv[], xqc_demo_svr_args_t *args)
 {
     int ch = 0;
-    while ((ch = getopt(argc, argv, "p:c:CD:l:L:6k:rdMiPs:R:u:a:F:f:j:")) != -1) {
+    while ((ch = getopt(argc, argv, "p:c:CD:l:L:6k:rdMiPs:R:u:a:F:f:j:J:")) != -1) {
         switch (ch) {
         /* listen port */
         case 'p':
@@ -1521,6 +1526,11 @@ xqc_demo_svr_parse_args(int argc, char *argv[], xqc_demo_svr_args_t *args)
         case 'j':
             printf("Bandwidth report interval: %s seconds\n", optarg);
             args->env_cfg.report_interval = atoi(optarg);
+            break;
+
+        case 'J':
+            printf("iperf output file: %s\n", optarg);
+            strncpy(args->env_cfg.iperf_output_file, optarg, sizeof(args->env_cfg.iperf_output_file) - 1);
             break;
 
         default:
@@ -1858,7 +1868,7 @@ main(int argc, char *argv[])
     if (args->env_cfg.report_interval > 0) {
         ctx->ev_bw_report = event_new(eb, -1, 0, xqc_demo_svr_bw_report_callback, ctx);
         ctx->bw_report_start_time = xqc_now();
-        ctx->iperf_fd = open("server_iperf_output.csv", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        ctx->iperf_fd = open(args->env_cfg.iperf_output_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (ctx->iperf_fd > 0) {
             char header[] = "interval_start,interval_end,transfer_MB,bandwidth_Mbits_sec\n";
             write(ctx->iperf_fd, header, strlen(header));

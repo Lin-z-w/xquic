@@ -252,6 +252,9 @@ typedef struct xqc_demo_cli_env_config_s {
 
     /* bandwidth report interval (seconds), 0 means disabled */
     int     report_interval;
+
+    /* iperf output file */
+    char    iperf_output_file[256];
 } xqc_demo_cli_env_config_t;
 
 
@@ -1898,6 +1901,7 @@ xqc_demo_cli_init_args(xqc_demo_cli_client_args_t *args)
     strncpy(args->env_cfg.out_file_dir, OUT_DIR, sizeof(args->env_cfg.out_file_dir));
     strncpy(args->env_cfg.key_out_path, KEY_PATH, sizeof(args->env_cfg.out_file_dir));
     args->env_cfg.report_interval = 1;
+    strncpy(args->env_cfg.iperf_output_file, "client_iperf_output.csv", sizeof(args->env_cfg.iperf_output_file) - 1);
 
     /* quic cfg */
     args->quic_cfg.alpn_type = ALPN_HQ;
@@ -2078,6 +2082,7 @@ xqc_demo_cli_usage(int argc, char *argv[])
         "   -f    max path id\n"
         "   -5    use X25519 group as the first choice\n"
         "   -j    Bandwidth report interval in seconds (default: 1, 0 to disable)\n"
+        "   -J    iperf output file path (default: client_iperf_output.csv)\n"
         , prog);
 }
 
@@ -2085,7 +2090,7 @@ void
 xqc_demo_cli_parse_args(int argc, char *argv[], xqc_demo_cli_client_args_t *args)
 {
     int ch = 0;
-    while ((ch = getopt(argc, argv, "a:p:c:Ct:S:0m:A:D:l:L:k:K:U:u:dMoi:w:Ps:b:Z:NQT:R:V:B:I:n:e:E:F:G:r:x:y:Y:f:z:q65Oj:")) != -1) {
+    while ((ch = getopt(argc, argv, "a:p:c:Ct:S:0m:A:D:l:L:k:K:U:u:dMoi:w:Ps:b:Z:NQT:R:V:B:I:n:e:E:F:G:r:x:y:Y:f:z:q65Oj:J:")) != -1) {
         switch (ch) {
         /* server ip */
         case '6':
@@ -2381,6 +2386,11 @@ xqc_demo_cli_parse_args(int argc, char *argv[], xqc_demo_cli_client_args_t *args
         case 'j':
             printf("Bandwidth report interval: %s seconds\n", optarg);
             args->env_cfg.report_interval = atoi(optarg);
+            break;
+
+        case 'J':
+            printf("iperf output file: %s\n", optarg);
+            strncpy(args->env_cfg.iperf_output_file, optarg, sizeof(args->env_cfg.iperf_output_file) - 1);
             break;
 
         default:
@@ -3322,7 +3332,7 @@ main(int argc, char *argv[])
 
     /* open iperf output file */
     if (args->env_cfg.report_interval > 0) {
-        ctx->iperf_fd = open("client_iperf_output.csv", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        ctx->iperf_fd = open(args->env_cfg.iperf_output_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (ctx->iperf_fd > 0) {
             char header[] = "interval_start,interval_end,transfer_MB,bandwidth_Mbits_sec\n";
             write(ctx->iperf_fd, header, strlen(header));
