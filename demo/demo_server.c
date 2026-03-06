@@ -154,6 +154,9 @@ typedef struct xqc_demo_svr_env_config_s {
     /* key export */
     int     key_output_flag;
     char    key_out_path[PATH_LEN];
+
+    /* bandwidth report interval (seconds), 0 means disabled */
+    int     report_interval;
 } xqc_demo_svr_env_config_t;
 
 
@@ -175,6 +178,7 @@ typedef struct xqc_demo_svr_ctx_s {
 
     xqc_engine_t        *engine;
     struct event        *ev_engine;
+    struct event        *ev_bw_report;
 
     /* ipv4 server */
     int                 fd;
@@ -195,6 +199,13 @@ typedef struct xqc_demo_svr_ctx_s {
     int                 keylog_fd;
 
     xqc_demo_svr_args_t *args;
+
+    /* bandwidth report context */
+    xqc_msec_t          bw_report_start_time;
+    int                 bw_report_count;
+    uint64_t            bw_last_bytes;
+    uint64_t            total_send_bytes;
+    int                 iperf_fd;
 } xqc_demo_svr_ctx_t;
 
 
@@ -229,6 +240,11 @@ typedef struct xqc_demo_svr_user_stream_s {
     size_t                      send_body_len;
     size_t                      recv_body_len;
     char                       *recv_buf;
+
+    /* bandwidth report */
+    xqc_msec_t                  start_time;
+    xqc_msec_t                  last_report_time;
+    size_t                      last_report_bytes;
 
     // xqc_demo_svr_user_conn_t         *conn;
     xqc_demo_svr_resource_t     res;  /* resource info */
@@ -496,15 +512,23 @@ xqc_demo_svr_hq_req_create_notify(xqc_hq_request_t *hqr, void *req_user_data)
     xqc_hq_request_set_user_data(hqr, user_stream);
 
     user_stream->recv_buf = calloc(1, REQ_BUF_SIZE);
+    user_stream->start_time = xqc_now();
+    user_stream->last_report_time = user_stream->start_time;
+    user_stream->last_report_bytes = 0;
 
     return 0;
 }
+
+static void xqc_demo_svr_print_stream_final_stats(xqc_demo_svr_user_stream_t *user_stream);
 
 int
 xqc_demo_svr_hq_req_close_notify(xqc_hq_request_t *hqr, void *req_user_data)
 {
     DEBUG;
     xqc_demo_svr_user_stream_t *user_stream = (xqc_demo_svr_user_stream_t*)req_user_data;
+
+    xqc_demo_svr_print_stream_final_stats(user_stream);
+
     free(user_stream);
     return 0;
 }
@@ -552,6 +576,8 @@ xqc_demo_svr_hq_send_file(xqc_hq_request_t *hqr, xqc_demo_svr_user_stream_t *use
         if (ret > 0) {
             res->buf_offset += ret;
             res->total_offset += ret;
+            user_stream->send_body_len += ret;
+            svr_ctx.total_send_bytes += ret;
 
         } else if (ret == 0) {
             break;
@@ -736,6 +762,9 @@ xqc_demo_svr_h3_request_create_notify(xqc_h3_request_t *h3_request, void *strm_u
 
     xqc_h3_request_set_user_data(h3_request, user_stream);
     user_stream->recv_buf = calloc(1, REQ_BUF_SIZE);
+    user_stream->start_time = xqc_now();
+    user_stream->last_report_time = user_stream->start_time;
+    user_stream->last_report_bytes = 0;
 
     return 0;
 }
@@ -749,6 +778,7 @@ xqc_demo_svr_h3_request_close_notify(xqc_h3_request_t *h3_request, void *strm_us
     printf("cwnd_blocked:%"PRIu64"\n", stats.cwnd_blocked_ms);
 
     xqc_demo_svr_user_stream_t *user_stream = (xqc_demo_svr_user_stream_t*)strm_user_data;
+    xqc_demo_svr_print_stream_final_stats(user_stream);
     xqc_demo_svr_close_user_stream_resource(user_stream);
     free(user_stream);
 
@@ -824,6 +854,8 @@ xqc_demo_svr_send_body(xqc_demo_svr_user_stream_t *user_stream)
         if (ret > 0) {
             res->buf_offset += ret;
             res->total_offset += ret;
+            user_stream->send_body_len += ret;
+            svr_ctx.total_send_bytes += ret;
 
         } else if (ret == 0) {
             break;
@@ -1197,6 +1229,87 @@ xqc_demo_svr_create_socket(xqc_demo_svr_ctx_t *ctx, xqc_demo_svr_net_config_t* c
     return 0;
 }
 
+static void
+xqc_demo_svr_print_stream_final_stats(xqc_demo_svr_user_stream_t *user_stream)
+{
+    if (user_stream->start_time == 0) {
+        return;
+    }
+
+    xqc_msec_t duration_ms = (xqc_now() - user_stream->start_time) / 1000;
+    double duration_s = duration_ms / 1000.0;
+    double transfer_mb = user_stream->send_body_len / (1024.0 * 1024.0);
+    double bandwidth_mbps = (duration_ms > 0) ?
+        (user_stream->send_body_len * 8.0 * 1000.0 / duration_ms / 1024.0 / 1024.0) : 0;
+
+    printf("\033[36m[ ID] Interval           Transfer     Bandwidth       Retr\033[0m\n");
+    printf("\033[36m[  0] %-16.3f %10.2f MB %12.2f Mbits/sec    0\033[0m\n",
+           0.0, transfer_mb, bandwidth_mbps);
+    printf("\033[36m[  0] Sent: %.2f MB  Received: %.2f MB  Duration: %.3f s\033[0m\n",
+           user_stream->send_body_len / (1024.0 * 1024.0),
+           user_stream->recv_body_len / (1024.0 * 1024.0),
+           duration_s);
+}
+
+static void
+xqc_demo_svr_bw_report_callback(int fd, short what, void *arg)
+{
+    xqc_demo_svr_ctx_t *ctx = (xqc_demo_svr_ctx_t *)arg;
+    xqc_msec_t now = xqc_now();
+
+    if (ctx->bw_report_start_time == 0) {
+        ctx->bw_report_start_time = now;
+        ctx->bw_last_bytes = 0;
+    }
+
+    uint64_t total_bytes = ctx->total_send_bytes;
+
+    if (total_bytes > 0) {
+        uint64_t interval_bytes = total_bytes - ctx->bw_last_bytes;
+        if (ctx->bw_report_count > 0 && interval_bytes == 0) {
+            interval_bytes = total_bytes;
+        }
+        
+        double interval_start = ctx->bw_report_count * ctx->args->env_cfg.report_interval;
+        double interval_end = interval_start + ctx->args->env_cfg.report_interval;
+
+        xqc_msec_t total_duration_ms = (now - ctx->bw_report_start_time) / 1000;
+        double total_duration_s = total_duration_ms / 1000.0;
+        
+        if (total_duration_s < interval_end) {
+            interval_end = total_duration_s;
+        }
+
+        double transfer_mb = interval_bytes / (1024.0 * 1024.0);
+        double bandwidth_mbps = (ctx->args->env_cfg.report_interval > 0) ?
+            (interval_bytes * 8.0 / ctx->args->env_cfg.report_interval / 1024.0 / 1024.0) : 0;
+
+        printf("\n%12s %12s %15s\n", "interval", "transfer", "bandwidth");
+        printf("----------------------------------------"
+               "----------------------------------------\n");
+        printf("[%6.1f-%6.1f] %10.2f MB %12.2f Mbits/sec\n",
+               interval_start, interval_end, transfer_mb, bandwidth_mbps);
+
+        if (ctx->iperf_fd > 0) {
+            char iperf_line[256];
+            snprintf(iperf_line, sizeof(iperf_line), 
+                "%6.1f,%6.1f,%10.2f,%12.2f\n",
+                interval_start, interval_end, transfer_mb, bandwidth_mbps);
+            write(ctx->iperf_fd, iperf_line, strlen(iperf_line));
+        }
+
+        ctx->bw_last_bytes = total_bytes;
+        ctx->bw_report_count++;
+    }
+
+    if (ctx->args->env_cfg.report_interval > 0) {
+        struct timeval tv;
+        tv.tv_sec = ctx->args->env_cfg.report_interval;
+        tv.tv_usec = 0;
+        event_add(ctx->ev_bw_report, &tv);
+    }
+}
+
 
 static void
 xqc_demo_svr_engine_callback(int fd, short what, void *arg)
@@ -1235,6 +1348,7 @@ xqc_demo_svr_usage(int argc, char *argv[])
             "   -R    Reinjection (1,2,4) \n"
             "   -u    Keyupdate packet threshold\n"
             "   -F    MTU size (default: 1200)\n"
+            "   -j    Bandwidth report interval in seconds (default: 1, 0 to disable)\n"
             , prog);
 }
 
@@ -1270,6 +1384,7 @@ xqc_demo_svr_init_args(xqc_demo_svr_args_t *args)
     strncpy(args->env_cfg.key_out_path, KEY_PATH, PATH_LEN - 1);
     strncpy(args->env_cfg.priv_key_path, PRIV_KEY_PATH, PATH_LEN - 1);
     strncpy(args->env_cfg.cert_pem_path, CERT_PEM_PATH, PATH_LEN - 1);
+    args->env_cfg.report_interval = 1;
 
     args->quic_cfg.keyupdate_pkt_threshold = UINT64_MAX;
     args->quic_cfg.least_available_cid_count = 1;
@@ -1280,7 +1395,7 @@ void
 xqc_demo_svr_parse_args(int argc, char *argv[], xqc_demo_svr_args_t *args)
 {
     int ch = 0;
-    while ((ch = getopt(argc, argv, "p:c:CD:l:L:6k:rdMiPs:R:u:a:F:f:")) != -1) {
+    while ((ch = getopt(argc, argv, "p:c:CD:l:L:6k:rdMiPs:R:u:a:F:f:j:")) != -1) {
         switch (ch) {
         /* listen port */
         case 'p':
@@ -1401,6 +1516,11 @@ xqc_demo_svr_parse_args(int argc, char *argv[], xqc_demo_svr_args_t *args)
         case 'f':
             printf("option init_max_path_id: %s\n", optarg);
             args->quic_cfg.max_initial_paths = atoi(optarg);
+            break;
+
+        case 'j':
+            printf("Bandwidth report interval: %s seconds\n", optarg);
+            args->env_cfg.report_interval = atoi(optarg);
             break;
 
         default:
@@ -1734,7 +1854,25 @@ main(int argc, char *argv[])
         xqc_demo_svr_socket_event_callback, ctx);
     event_add(ctx->ev_socket6, NULL);
 
+    /* bandwidth report timer */
+    if (args->env_cfg.report_interval > 0) {
+        ctx->ev_bw_report = event_new(eb, -1, 0, xqc_demo_svr_bw_report_callback, ctx);
+        ctx->bw_report_start_time = xqc_now();
+        ctx->iperf_fd = open("server_iperf_output.csv", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (ctx->iperf_fd > 0) {
+            char header[] = "interval_start,interval_end,transfer_MB,bandwidth_Mbits_sec\n";
+            write(ctx->iperf_fd, header, strlen(header));
+        }
+        struct timeval tv = {args->env_cfg.report_interval, 0};
+        event_add(ctx->ev_bw_report, &tv);
+    }
+
     event_base_dispatch(eb);
+
+    /* close iperf output file */
+    if (ctx->iperf_fd > 0) {
+        close(ctx->iperf_fd);
+    }
 
     xqc_engine_destroy(ctx->engine);
     // xqc_demo_svr_free_ctx(ctx);

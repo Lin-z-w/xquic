@@ -66,6 +66,10 @@ typedef struct xqc_demo_cli_user_stream_s {
     int                         recv_fin;
     xqc_msec_t                  start_time;
 
+    /* bandwidth report */
+    xqc_msec_t                  last_report_time;
+    size_t                      last_report_bytes;
+
     /* hq request content */
     xqc_hq_request_t           *hq_request;
     char                       *send_buf;
@@ -245,6 +249,9 @@ typedef struct xqc_demo_cli_env_config_s {
 
     /* life cycle */
     int     life;
+
+    /* bandwidth report interval (seconds), 0 means disabled */
+    int     report_interval;
 } xqc_demo_cli_env_config_t;
 
 
@@ -381,6 +388,7 @@ typedef struct xqc_demo_cli_ctx_s {
     struct event    *ev_engine;
     struct event    *ev_task;
     struct event    *ev_kill;
+    struct event    *ev_bw_report;
     struct event_base *eb;  /* handle of libevent */
 
     /* log context */
@@ -395,6 +403,12 @@ typedef struct xqc_demo_cli_ctx_s {
 
     /* task schedule context */
     xqc_demo_cli_task_ctx_t     task_ctx;
+
+    /* bandwidth report context */
+    xqc_msec_t      bw_report_start_time;
+    int             bw_report_count;
+    uint64_t        bw_last_bytes;
+    int             iperf_fd;
 } xqc_demo_cli_ctx_t;
 
 typedef struct xqc_demo_cli_user_path_s {
@@ -552,6 +566,103 @@ xqc_demo_cli_on_stream_fin(xqc_demo_cli_user_stream_t *user_stream)
     printf("task[%d], fin_cnt: %d, fin_flag: %d\n", task_idx, 
         ctx->schedule.schedule_info[task_idx].req_fin_cnt,
         ctx->schedule.schedule_info[task_idx].fin_flag);
+}
+
+static void
+xqc_demo_cli_print_stream_final_stats(xqc_demo_cli_user_stream_t *user_stream)
+{
+    if (user_stream->start_time == 0) {
+        return;
+    }
+
+    xqc_msec_t duration_ms = (xqc_now() - user_stream->start_time) / 1000;
+    double duration_s = duration_ms / 1000.0;
+    double transfer_mb = (user_stream->recv_body_len + user_stream->send_body_len) / (1024.0 * 1024.0);
+    double bandwidth_mbps = (duration_ms > 0) ? 
+        ((user_stream->recv_body_len + user_stream->send_body_len) * 8.0 * 1000.0 / duration_ms / 1024.0 / 1024.0) : 0;
+
+    printf("\033[36m[ ID] Interval           Transfer     Bandwidth       Retr\033[0m\n");
+    printf("\033[36m[  0] %-16.3f %10.2f MB %12.2f Mbits/sec    0\033[0m\n",
+           0.0, transfer_mb, bandwidth_mbps);
+    printf("\033[36m[  0] Sent: %.2f MB  Received: %.2f MB  Duration: %.3f s\033[0m\n",
+           user_stream->send_body_len / (1024.0 * 1024.0),
+           user_stream->recv_body_len / (1024.0 * 1024.0),
+           duration_s);
+}
+
+static void
+xqc_demo_cli_bw_report_callback(int fd, short what, void *arg) 
+{
+    xqc_demo_cli_ctx_t *ctx = (xqc_demo_cli_ctx_t *)arg;
+    xqc_msec_t now = xqc_now();
+
+    if (ctx->bw_report_start_time == 0) {
+        ctx->bw_report_start_time = now;
+        ctx->bw_last_bytes = 0;
+    }
+
+    uint64_t total_bytes = 0;
+
+    for (size_t i = 0; i < ctx->task_ctx.task_cnt; i++) {
+        if (ctx->task_ctx.schedule.schedule_info[i].status != TASK_STATUS_RUNNING) {
+            continue;
+        }
+
+        xqc_demo_cli_task_t *task = &ctx->task_ctx.tasks[i];
+        if (task->user_conn == NULL) {
+            continue;
+        }
+
+        if (task->user_conn->ctx && task->user_conn->ctx->engine) {
+            xqc_conn_stats_t stats = xqc_conn_get_stats(task->user_conn->ctx->engine, &task->user_conn->cid);
+            total_bytes += stats.total_app_bytes;
+        }
+    }
+
+    if (total_bytes > 0) {
+        uint64_t interval_bytes = total_bytes - ctx->bw_last_bytes;
+        if (ctx->bw_report_count > 0 && interval_bytes == 0) {
+            interval_bytes = total_bytes;
+        }
+        
+        double interval_start = ctx->bw_report_count * ctx->args->env_cfg.report_interval;
+        double interval_end = interval_start + ctx->args->env_cfg.report_interval;
+
+        xqc_msec_t total_duration_ms = (now - ctx->bw_report_start_time) / 1000;
+        double total_duration_s = total_duration_ms / 1000.0;
+        
+        if (total_duration_s < interval_end) {
+            interval_end = total_duration_s;
+        }
+
+        double transfer_mb = interval_bytes / (1024.0 * 1024.0);
+        double bandwidth_mbps = (ctx->args->env_cfg.report_interval > 0) ?
+            (interval_bytes * 8.0 / ctx->args->env_cfg.report_interval / 1024.0 / 1024.0) : 0;
+
+        printf("\n%12s %12s %15s\n", "interval", "transfer", "bandwidth");
+        printf("----------------------------------------"
+               "----------------------------------------\n");
+        printf("[%6.1f-%6.1f] %10.2f MB %12.2f Mbits/sec\n",
+               interval_start, interval_end, transfer_mb, bandwidth_mbps);
+
+        if (ctx->iperf_fd > 0) {
+            char iperf_line[256];
+            snprintf(iperf_line, sizeof(iperf_line), 
+                "%6.1f,%6.1f,%10.2f,%12.2f\n",
+                interval_start, interval_end, transfer_mb, bandwidth_mbps);
+            write(ctx->iperf_fd, iperf_line, strlen(iperf_line));
+        }
+
+        ctx->bw_last_bytes = total_bytes;
+        ctx->bw_report_count++;
+    }
+
+    if (ctx->args->env_cfg.report_interval > 0) {
+        struct timeval tv;
+        tv.tv_sec = ctx->args->env_cfg.report_interval;
+        tv.tv_usec = 0;
+        event_add(ctx->ev_bw_report, &tv);
+    }
 }
 
 /* directly finish a task */
@@ -1093,6 +1204,11 @@ xqc_demo_cli_hq_req_read_notify(xqc_hq_request_t *hqr, void *req_user_data)
 
     xqc_demo_path_status_trigger(user_stream->user_conn);
 
+    if (user_stream->last_report_time == 0 && user_stream->start_time > 0) {
+        user_stream->last_report_time = user_stream->start_time;
+        user_stream->last_report_bytes = 0;
+    }
+
     ssize_t read = 0;
     ssize_t read_sum = 0;
     do {
@@ -1152,6 +1268,8 @@ xqc_demo_cli_hq_req_close_notify(xqc_hq_request_t *hqr, void *req_user_data)
 
     printf("\033[33m[HQ-req] send_bytes:%zu, recv_bytes:%zu, path_info:%s\n\033[0m", 
            stats.send_body_size, stats.recv_body_size, stats.stream_info);
+
+    xqc_demo_cli_print_stream_final_stats(user_stream);
 
     /* task schedule */
     xqc_demo_cli_continue_send_reqs(user_stream->user_conn);
@@ -1214,6 +1332,11 @@ xqc_demo_cli_h3_request_read_notify(xqc_h3_request_t *h3_request, xqc_request_no
     uint32_t task_idx = user_conn->task->task_idx;
 
     xqc_demo_path_status_trigger(user_conn);
+
+    if (user_stream->last_report_time == 0 && user_stream->start_time > 0) {
+        user_stream->last_report_time = user_stream->start_time;
+        user_stream->last_report_bytes = 0;
+    }
 
     // printf("xqc_demo_cli_h3_request_read_notify, h3_request: %p, user_stream: %p\n", h3_request, user_stream);
     if (flag & XQC_REQ_NOTIFY_READ_HEADER) {
@@ -1350,6 +1473,8 @@ xqc_demo_cli_h3_request_close_notify(xqc_h3_request_t *h3_request, void *user_da
            stats.send_body_size + stats.send_header_size, 
            stats.recv_body_size + stats.recv_header_size,
            stats.stream_info);
+
+    xqc_demo_cli_print_stream_final_stats(user_stream);
 
     free(user_stream);
     return 0;
@@ -1772,6 +1897,7 @@ xqc_demo_cli_init_args(xqc_demo_cli_client_args_t *args)
     strncpy(args->env_cfg.log_path, LOG_PATH, sizeof(args->env_cfg.log_path));
     strncpy(args->env_cfg.out_file_dir, OUT_DIR, sizeof(args->env_cfg.out_file_dir));
     strncpy(args->env_cfg.key_out_path, KEY_PATH, sizeof(args->env_cfg.out_file_dir));
+    args->env_cfg.report_interval = 1;
 
     /* quic cfg */
     args->quic_cfg.alpn_type = ALPN_HQ;
@@ -1951,6 +2077,7 @@ xqc_demo_cli_usage(int argc, char *argv[])
         "   -Y    cid retirement after x ms\n"
         "   -f    max path id\n"
         "   -5    use X25519 group as the first choice\n"
+        "   -j    Bandwidth report interval in seconds (default: 1, 0 to disable)\n"
         , prog);
 }
 
@@ -1958,7 +2085,7 @@ void
 xqc_demo_cli_parse_args(int argc, char *argv[], xqc_demo_cli_client_args_t *args)
 {
     int ch = 0;
-    while ((ch = getopt(argc, argv, "a:p:c:Ct:S:0m:A:D:l:L:k:K:U:u:dMoi:w:Ps:b:Z:NQT:R:V:B:I:n:e:E:F:G:r:x:y:Y:f:z:q65O")) != -1) {
+    while ((ch = getopt(argc, argv, "a:p:c:Ct:S:0m:A:D:l:L:k:K:U:u:dMoi:w:Ps:b:Z:NQT:R:V:B:I:n:e:E:F:G:r:x:y:Y:f:z:q65Oj:")) != -1) {
         switch (ch) {
         /* server ip */
         case '6':
@@ -2249,6 +2376,11 @@ xqc_demo_cli_parse_args(int argc, char *argv[], xqc_demo_cli_client_args_t *args
         case '5':
             printf("use x25519\n");
             args->quic_cfg.use_x25519 = 1;
+            break;
+
+        case 'j':
+            printf("Bandwidth report interval: %s seconds\n", optarg);
+            args->env_cfg.report_interval = atoi(optarg);
             break;
 
         default:
@@ -3188,15 +3320,37 @@ main(int argc, char *argv[])
     xqc_demo_cli_ctx_t *ctx = calloc(1, sizeof(xqc_demo_cli_ctx_t));
     xqc_demo_cli_init_ctx(ctx, args);
 
+    /* open iperf output file */
+    if (args->env_cfg.report_interval > 0) {
+        ctx->iperf_fd = open("client_iperf_output.csv", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (ctx->iperf_fd > 0) {
+            char header[] = "interval_start,interval_end,transfer_MB,bandwidth_Mbits_sec\n";
+            write(ctx->iperf_fd, header, strlen(header));
+        }
+    }
+
     /* engine event */
     ctx->eb = event_base_new();
     ctx->ev_engine = event_new(ctx->eb, -1, 0, xqc_demo_cli_engine_callback, ctx);
     xqc_demo_cli_init_xquic_engine(ctx, args);
 
+    /* bandwidth report timer */
+    if (args->env_cfg.report_interval > 0) {
+        ctx->ev_bw_report = event_new(ctx->eb, -1, 0, xqc_demo_cli_bw_report_callback, ctx);
+        ctx->bw_report_start_time = xqc_now();
+        struct timeval tv = {args->env_cfg.report_interval, 0};
+        event_add(ctx->ev_bw_report, &tv);
+    }
+
     /* start task scheduler */
     xqc_demo_cli_start_task_manager(ctx);
 
     event_base_dispatch(ctx->eb);
+
+    /* close iperf output file */
+    if (ctx->iperf_fd > 0) {
+        close(ctx->iperf_fd);
+    }
 
     xqc_engine_destroy(ctx->engine);
     xqc_demo_cli_free_ctx(ctx);
