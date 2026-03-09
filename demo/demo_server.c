@@ -208,6 +208,7 @@ typedef struct xqc_demo_svr_ctx_s {
 
     /* bandwidth report context */
     xqc_msec_t          bw_report_start_time;
+    xqc_msec_t          bw_last_report_time;
     int                 bw_report_count;
     uint64_t            bw_last_bytes;
     uint64_t            total_send_bytes;
@@ -540,6 +541,24 @@ xqc_demo_svr_hq_req_create_notify(xqc_hq_request_t *hqr, void *req_user_data)
                svr_ctx.args->env_cfg.transfer_duration);
     }
 
+    /* start bandwidth report on first request */
+    if (svr_ctx.args->env_cfg.report_interval > 0 && svr_ctx.bw_report_start_time == 0) {
+        svr_ctx.bw_report_start_time = xqc_now();
+        svr_ctx.bw_last_report_time = svr_ctx.bw_report_start_time;
+        svr_ctx.bw_last_bytes = 0;
+        svr_ctx.bw_report_count = 0;
+        svr_ctx.iperf_fd = open(svr_ctx.args->env_cfg.iperf_output_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (svr_ctx.iperf_fd > 0) {
+            char header[] = "interval_start,interval_end,transfer_MB,bandwidth_Mbits_sec\n";
+            write(svr_ctx.iperf_fd, header, strlen(header));
+        }
+        double interval = svr_ctx.args->env_cfg.report_interval;
+        struct timeval tv;
+        tv.tv_sec = (int)interval;
+        tv.tv_usec = (int)((interval - tv.tv_sec) * 1000000);
+        event_add(svr_ctx.ev_bw_report, &tv);
+    }
+
     return 0;
 }
 
@@ -801,6 +820,24 @@ xqc_demo_svr_h3_request_create_notify(xqc_h3_request_t *h3_request, void *strm_u
         event_add(svr_ctx.ev_transfer_stop, &tv_stop);
         printf("\033[33m[Server] Transfer duration timer started: %d seconds\033[0m\n", 
                svr_ctx.args->env_cfg.transfer_duration);
+    }
+
+    /* start bandwidth report on first request */
+    if (svr_ctx.args->env_cfg.report_interval > 0 && svr_ctx.bw_report_start_time == 0) {
+        svr_ctx.bw_report_start_time = xqc_now();
+        svr_ctx.bw_last_report_time = svr_ctx.bw_report_start_time;
+        svr_ctx.bw_last_bytes = 0;
+        svr_ctx.bw_report_count = 0;
+        svr_ctx.iperf_fd = open(svr_ctx.args->env_cfg.iperf_output_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (svr_ctx.iperf_fd > 0) {
+            char header[] = "interval_start,interval_end,transfer_MB,bandwidth_Mbits_sec\n";
+            write(svr_ctx.iperf_fd, header, strlen(header));
+        }
+        double interval = svr_ctx.args->env_cfg.report_interval;
+        struct timeval tv;
+        tv.tv_sec = (int)interval;
+        tv.tv_usec = (int)((interval - tv.tv_sec) * 1000000);
+        event_add(svr_ctx.ev_bw_report, &tv);
     }
 
     return 0;
@@ -1312,6 +1349,7 @@ xqc_demo_svr_bw_report_callback(int fd, short what, void *arg)
 
     if (ctx->bw_report_start_time == 0) {
         ctx->bw_report_start_time = now;
+        ctx->bw_last_report_time = now;
         ctx->bw_last_bytes = 0;
     }
 
@@ -1320,25 +1358,14 @@ xqc_demo_svr_bw_report_callback(int fd, short what, void *arg)
     if (total_bytes > 0) {
         uint64_t interval_bytes = total_bytes - ctx->bw_last_bytes;
         
-        double interval_start = ctx->bw_report_count * ctx->args->env_cfg.report_interval;
-        double interval_end = interval_start + ctx->args->env_cfg.report_interval;
-
-        xqc_msec_t total_duration_ms = (now - ctx->bw_report_start_time) / 1000;
-        double total_duration_s = total_duration_ms / 1000.0;
-        
-        if (total_duration_s < interval_end) {
-            interval_end = total_duration_s;
-        }
+        // double interval_start = (ctx->bw_last_report_time - ctx->bw_report_start_time) / 1000.0;
+        // double interval_end = (now - ctx->bw_report_start_time) / 1000.0;
+        double interval_start = ctx->bw_last_report_time;
+        double interval_end = now;
 
         double transfer_mb = interval_bytes / (1024.0 * 1024.0);
         double bandwidth_mbps = (ctx->args->env_cfg.report_interval > 0) ?
             (interval_bytes * 8.0 / ctx->args->env_cfg.report_interval / 1024.0 / 1024.0) : 0;
-
-        printf("\n%12s %12s %15s\n", "interval", "transfer", "bandwidth");
-        printf("----------------------------------------"
-               "----------------------------------------\n");
-        printf("[%6.1f-%6.1f] %10.2f MB %12.2f Mbits/sec\n",
-               interval_start, interval_end, transfer_mb, bandwidth_mbps);
 
         if (ctx->iperf_fd > 0) {
             char iperf_line[256];
@@ -1349,6 +1376,7 @@ xqc_demo_svr_bw_report_callback(int fd, short what, void *arg)
         }
 
         ctx->bw_last_bytes = total_bytes;
+        ctx->bw_last_report_time = now;
         ctx->bw_report_count++;
     }
 
@@ -1919,20 +1947,9 @@ main(int argc, char *argv[])
         xqc_demo_svr_socket_event_callback, ctx);
     event_add(ctx->ev_socket6, NULL);
 
-    /* bandwidth report timer */
+    /* bandwidth report timer - create event but don't start yet, will start on first request */
     if (args->env_cfg.report_interval > 0) {
         ctx->ev_bw_report = event_new(eb, -1, 0, xqc_demo_svr_bw_report_callback, ctx);
-        ctx->bw_report_start_time = xqc_now();
-        ctx->iperf_fd = open(args->env_cfg.iperf_output_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (ctx->iperf_fd > 0) {
-            char header[] = "interval_start,interval_end,transfer_MB,bandwidth_Mbits_sec\n";
-            write(ctx->iperf_fd, header, strlen(header));
-        }
-        double interval = args->env_cfg.report_interval;
-        struct timeval tv;
-        tv.tv_sec = (int)interval;
-        tv.tv_usec = (int)((interval - tv.tv_sec) * 1000000);
-        event_add(ctx->ev_bw_report, &tv);
     }
 
     event_base_dispatch(eb);

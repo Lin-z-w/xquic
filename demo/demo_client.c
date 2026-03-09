@@ -409,6 +409,7 @@ typedef struct xqc_demo_cli_ctx_s {
 
     /* bandwidth report context */
     xqc_msec_t      bw_report_start_time;
+    xqc_msec_t      bw_last_report_time;
     int             bw_report_count;
     uint64_t        bw_last_bytes;
     int             iperf_fd;
@@ -601,6 +602,7 @@ xqc_demo_cli_bw_report_callback(int fd, short what, void *arg)
 
     if (ctx->bw_report_start_time == 0) {
         ctx->bw_report_start_time = now;
+        ctx->bw_last_report_time = now;
         ctx->bw_last_bytes = 0;
     }
 
@@ -625,25 +627,12 @@ xqc_demo_cli_bw_report_callback(int fd, short what, void *arg)
     if (total_bytes > 0) {
         uint64_t interval_bytes = total_bytes - ctx->bw_last_bytes;
         
-        double interval_start = ctx->bw_report_count * ctx->args->env_cfg.report_interval;
-        double interval_end = interval_start + ctx->args->env_cfg.report_interval;
-
-        xqc_msec_t total_duration_ms = (now - ctx->bw_report_start_time) / 1000;
-        double total_duration_s = total_duration_ms / 1000.0;
-        
-        if (total_duration_s < interval_end) {
-            interval_end = total_duration_s;
-        }
+        double interval_start = (ctx->bw_last_report_time - ctx->bw_report_start_time) / 1000.0;
+        double interval_end = (now - ctx->bw_report_start_time) / 1000.0;
 
         double transfer_mb = interval_bytes / (1024.0 * 1024.0);
         double bandwidth_mbps = (ctx->args->env_cfg.report_interval > 0) ?
             (interval_bytes * 8.0 / ctx->args->env_cfg.report_interval / 1024.0 / 1024.0) : 0;
-
-        printf("\n%12s %12s %15s\n", "interval", "transfer", "bandwidth");
-        printf("----------------------------------------"
-               "----------------------------------------\n");
-        printf("[%6.1f-%6.1f] %10.2f MB %12.2f Mbits/sec\n",
-               interval_start, interval_end, transfer_mb, bandwidth_mbps);
 
         if (ctx->iperf_fd > 0) {
             char iperf_line[256];
@@ -654,6 +643,7 @@ xqc_demo_cli_bw_report_callback(int fd, short what, void *arg)
         }
 
         ctx->bw_last_bytes = total_bytes;
+        ctx->bw_last_report_time = now;
         ctx->bw_report_count++;
     }
 
@@ -3346,6 +3336,7 @@ main(int argc, char *argv[])
     if (args->env_cfg.report_interval > 0) {
         ctx->ev_bw_report = event_new(ctx->eb, -1, 0, xqc_demo_cli_bw_report_callback, ctx);
         ctx->bw_report_start_time = xqc_now();
+        ctx->bw_last_report_time = ctx->bw_report_start_time;
         double interval = args->env_cfg.report_interval;
         struct timeval tv;
         tv.tv_sec = (int)interval;
