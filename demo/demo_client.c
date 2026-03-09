@@ -251,7 +251,7 @@ typedef struct xqc_demo_cli_env_config_s {
     int     life;
 
     /* bandwidth report interval (seconds), 0 means disabled */
-    int     report_interval;
+    double   report_interval;
 
     /* iperf output file */
     char    iperf_output_file[256];
@@ -624,9 +624,6 @@ xqc_demo_cli_bw_report_callback(int fd, short what, void *arg)
 
     if (total_bytes > 0) {
         uint64_t interval_bytes = total_bytes - ctx->bw_last_bytes;
-        if (ctx->bw_report_count > 0 && interval_bytes == 0) {
-            interval_bytes = total_bytes;
-        }
         
         double interval_start = ctx->bw_report_count * ctx->args->env_cfg.report_interval;
         double interval_end = interval_start + ctx->args->env_cfg.report_interval;
@@ -661,9 +658,10 @@ xqc_demo_cli_bw_report_callback(int fd, short what, void *arg)
     }
 
     if (ctx->args->env_cfg.report_interval > 0) {
+        double interval = ctx->args->env_cfg.report_interval;
         struct timeval tv;
-        tv.tv_sec = ctx->args->env_cfg.report_interval;
-        tv.tv_usec = 0;
+        tv.tv_sec = (int)interval;
+        tv.tv_usec = (int)((interval - tv.tv_sec) * 1000000);
         event_add(ctx->ev_bw_report, &tv);
     }
 }
@@ -2385,7 +2383,7 @@ xqc_demo_cli_parse_args(int argc, char *argv[], xqc_demo_cli_client_args_t *args
 
         case 'j':
             printf("Bandwidth report interval: %s seconds\n", optarg);
-            args->env_cfg.report_interval = atoi(optarg);
+            args->env_cfg.report_interval = atof(optarg);
             break;
 
         case 'J':
@@ -3348,7 +3346,10 @@ main(int argc, char *argv[])
     if (args->env_cfg.report_interval > 0) {
         ctx->ev_bw_report = event_new(ctx->eb, -1, 0, xqc_demo_cli_bw_report_callback, ctx);
         ctx->bw_report_start_time = xqc_now();
-        struct timeval tv = {args->env_cfg.report_interval, 0};
+        double interval = args->env_cfg.report_interval;
+        struct timeval tv;
+        tv.tv_sec = (int)interval;
+        tv.tv_usec = (int)((interval - tv.tv_sec) * 1000000);
         event_add(ctx->ev_bw_report, &tv);
     }
 

@@ -156,10 +156,13 @@ typedef struct xqc_demo_svr_env_config_s {
     char    key_out_path[PATH_LEN];
 
     /* bandwidth report interval (seconds), 0 means disabled */
-    int     report_interval;
+    double   report_interval;
 
     /* iperf output file */
     char    iperf_output_file[PATH_LEN];
+
+    /* transfer duration in seconds, 0 means unlimited */
+    int     transfer_duration;
 } xqc_demo_svr_env_config_t;
 
 
@@ -209,6 +212,10 @@ typedef struct xqc_demo_svr_ctx_s {
     uint64_t            bw_last_bytes;
     uint64_t            total_send_bytes;
     int                 iperf_fd;
+
+    /* transfer duration control */
+    struct event        *ev_transfer_stop;
+    int                 transfer_stopped;
 } xqc_demo_svr_ctx_t;
 
 
@@ -248,6 +255,9 @@ typedef struct xqc_demo_svr_user_stream_s {
     xqc_msec_t                  start_time;
     xqc_msec_t                  last_report_time;
     size_t                      last_report_bytes;
+
+    /* transfer control */
+    int                         stop_send;
 
     // xqc_demo_svr_user_conn_t         *conn;
     xqc_demo_svr_resource_t     res;  /* resource info */
@@ -505,6 +515,8 @@ xqc_demo_svr_send_rsp_resource(xqc_demo_svr_user_stream_t *user_stream, char *da
     return ret;
 }
 
+static void xqc_demo_svr_transfer_stop_callback(int fd, short what, void *arg);
+
 int
 xqc_demo_svr_hq_req_create_notify(xqc_hq_request_t *hqr, void *req_user_data)
 {
@@ -518,6 +530,15 @@ xqc_demo_svr_hq_req_create_notify(xqc_hq_request_t *hqr, void *req_user_data)
     user_stream->start_time = xqc_now();
     user_stream->last_report_time = user_stream->start_time;
     user_stream->last_report_bytes = 0;
+
+    /* start transfer duration timer on first request */
+    if (svr_ctx.args->env_cfg.transfer_duration > 0 && svr_ctx.ev_transfer_stop == NULL) {
+        svr_ctx.ev_transfer_stop = event_new(svr_ctx.eb, -1, 0, xqc_demo_svr_transfer_stop_callback, &svr_ctx);
+        struct timeval tv_stop = {svr_ctx.args->env_cfg.transfer_duration, 0};
+        event_add(svr_ctx.ev_transfer_stop, &tv_stop);
+        printf("\033[33m[Server] Transfer duration timer started: %d seconds\033[0m\n", 
+               svr_ctx.args->env_cfg.transfer_duration);
+    }
 
     return 0;
 }
@@ -543,6 +564,10 @@ xqc_demo_svr_hq_req_close_notify(xqc_hq_request_t *hqr, void *req_user_data)
 int
 xqc_demo_svr_hq_send_file(xqc_hq_request_t *hqr, xqc_demo_svr_user_stream_t *user_stream)
 {
+    if (user_stream->stop_send || svr_ctx.transfer_stopped) {
+        return -1;
+    }
+
     int ret = 0;
     xqc_demo_svr_resource_t *res = &user_stream->res;
     while (res->total_offset < res->total_len) {   /* still have bytes to be sent */
@@ -620,7 +645,7 @@ xqc_demo_svr_handle_hq_request(xqc_demo_svr_user_stream_t *user_stream, xqc_hq_r
         fseek(user_stream->res.fp, 0, SEEK_SET);
 
     } else {
-        user_stream->res.total_len = atoi(resource + 1);
+        user_stream->res.total_len = atoll(resource + 1);
         if (user_stream->res.total_len == 0) {
             user_stream->res.total_len = 1;
         }
@@ -769,6 +794,15 @@ xqc_demo_svr_h3_request_create_notify(xqc_h3_request_t *h3_request, void *strm_u
     user_stream->last_report_time = user_stream->start_time;
     user_stream->last_report_bytes = 0;
 
+    /* start transfer duration timer on first request */
+    if (svr_ctx.args->env_cfg.transfer_duration > 0 && svr_ctx.ev_transfer_stop == NULL) {
+        svr_ctx.ev_transfer_stop = event_new(svr_ctx.eb, -1, 0, xqc_demo_svr_transfer_stop_callback, &svr_ctx);
+        struct timeval tv_stop = {svr_ctx.args->env_cfg.transfer_duration, 0};
+        event_add(svr_ctx.ev_transfer_stop, &tv_stop);
+        printf("\033[33m[Server] Transfer duration timer started: %d seconds\033[0m\n", 
+               svr_ctx.args->env_cfg.transfer_duration);
+    }
+
     return 0;
 }
 
@@ -821,6 +855,10 @@ xqc_demo_svr_request_send_body(xqc_demo_svr_user_stream_t *user_stream, char *da
 int
 xqc_demo_svr_send_body(xqc_demo_svr_user_stream_t *user_stream)
 {
+    if (user_stream->stop_send || svr_ctx.transfer_stopped) {
+        return -1;
+    }
+
     int ret = 0;
     xqc_demo_svr_resource_t *res = &user_stream->res;
     while (res->total_offset < res->total_len) {    /* still have bytes to be sent */
@@ -925,7 +963,7 @@ xqc_demo_svr_handle_h3_request(xqc_demo_svr_user_stream_t *user_stream,
         fseek(user_stream->res.fp, 0, SEEK_SET);
 
     } else {
-        user_stream->res.total_len = atoi(user_stream->recv_buf + 1);
+        user_stream->res.total_len = atoll(user_stream->recv_buf + 1);
         if (user_stream->res.total_len == 0) {
             user_stream->res.total_len = 1;
         }
@@ -1255,6 +1293,18 @@ xqc_demo_svr_print_stream_final_stats(xqc_demo_svr_user_stream_t *user_stream)
 }
 
 static void
+xqc_demo_svr_transfer_stop_callback(int fd, short what, void *arg)
+{
+    xqc_demo_svr_ctx_t *ctx = (xqc_demo_svr_ctx_t *)arg;
+    ctx->transfer_stopped = 1;
+    printf("\033[31m[Server] Transfer duration reached, stopping send...\033[0m\n");
+
+    if (ctx->ev_bw_report) {
+        event_del(ctx->ev_bw_report);
+    }
+}
+
+static void
 xqc_demo_svr_bw_report_callback(int fd, short what, void *arg)
 {
     xqc_demo_svr_ctx_t *ctx = (xqc_demo_svr_ctx_t *)arg;
@@ -1269,9 +1319,6 @@ xqc_demo_svr_bw_report_callback(int fd, short what, void *arg)
 
     if (total_bytes > 0) {
         uint64_t interval_bytes = total_bytes - ctx->bw_last_bytes;
-        if (ctx->bw_report_count > 0 && interval_bytes == 0) {
-            interval_bytes = total_bytes;
-        }
         
         double interval_start = ctx->bw_report_count * ctx->args->env_cfg.report_interval;
         double interval_end = interval_start + ctx->args->env_cfg.report_interval;
@@ -1306,9 +1353,10 @@ xqc_demo_svr_bw_report_callback(int fd, short what, void *arg)
     }
 
     if (ctx->args->env_cfg.report_interval > 0) {
+        double interval = ctx->args->env_cfg.report_interval;
         struct timeval tv;
-        tv.tv_sec = ctx->args->env_cfg.report_interval;
-        tv.tv_usec = 0;
+        tv.tv_sec = (int)interval;
+        tv.tv_usec = (int)((interval - tv.tv_sec) * 1000000);
         event_add(ctx->ev_bw_report, &tv);
     }
 }
@@ -1353,6 +1401,7 @@ xqc_demo_svr_usage(int argc, char *argv[])
             "   -F    MTU size (default: 1200)\n"
             "   -j    Bandwidth report interval in seconds (default: 1, 0 to disable)\n"
             "   -J    iperf output file path (default: server_iperf_output.csv)\n"
+            "   -T    Transfer duration in seconds (default: unlimited)\n"
             , prog);
 }
 
@@ -1390,6 +1439,7 @@ xqc_demo_svr_init_args(xqc_demo_svr_args_t *args)
     strncpy(args->env_cfg.cert_pem_path, CERT_PEM_PATH, PATH_LEN - 1);
     args->env_cfg.report_interval = 1;
     strncpy(args->env_cfg.iperf_output_file, "server_iperf_output.csv", sizeof(args->env_cfg.iperf_output_file) - 1);
+    args->env_cfg.transfer_duration = 0;  /* 0 means unlimited */
 
     args->quic_cfg.keyupdate_pkt_threshold = UINT64_MAX;
     args->quic_cfg.least_available_cid_count = 1;
@@ -1400,7 +1450,7 @@ void
 xqc_demo_svr_parse_args(int argc, char *argv[], xqc_demo_svr_args_t *args)
 {
     int ch = 0;
-    while ((ch = getopt(argc, argv, "p:c:CD:l:L:6k:rdMiPs:R:u:a:F:f:j:J:")) != -1) {
+    while ((ch = getopt(argc, argv, "p:c:CD:l:L:6k:rdMiPs:R:u:a:F:f:j:J:T:")) != -1) {
         switch (ch) {
         /* listen port */
         case 'p':
@@ -1525,12 +1575,17 @@ xqc_demo_svr_parse_args(int argc, char *argv[], xqc_demo_svr_args_t *args)
 
         case 'j':
             printf("Bandwidth report interval: %s seconds\n", optarg);
-            args->env_cfg.report_interval = atoi(optarg);
+            args->env_cfg.report_interval = atof(optarg);
             break;
 
         case 'J':
             printf("iperf output file: %s\n", optarg);
             strncpy(args->env_cfg.iperf_output_file, optarg, sizeof(args->env_cfg.iperf_output_file) - 1);
+            break;
+
+        case 'T':
+            printf("Transfer duration: %s seconds\n", optarg);
+            args->env_cfg.transfer_duration = atoi(optarg);
             break;
 
         default:
@@ -1873,7 +1928,10 @@ main(int argc, char *argv[])
             char header[] = "interval_start,interval_end,transfer_MB,bandwidth_Mbits_sec\n";
             write(ctx->iperf_fd, header, strlen(header));
         }
-        struct timeval tv = {args->env_cfg.report_interval, 0};
+        double interval = args->env_cfg.report_interval;
+        struct timeval tv;
+        tv.tv_sec = (int)interval;
+        tv.tv_usec = (int)((interval - tv.tv_sec) * 1000000);
         event_add(ctx->ev_bw_report, &tv);
     }
 
