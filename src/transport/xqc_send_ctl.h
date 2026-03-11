@@ -170,6 +170,7 @@ typedef struct xqc_send_ctl_s {
     unsigned                    ctl_recent_lost_count[2];
     xqc_usec_t                  ctl_recent_stats_timestamp;
 
+    xqc_usec_t                  ctl_last_ack_recv_time;
     uint64_t                    ctl_ack_sent_cnt;
 
 } xqc_send_ctl_t;

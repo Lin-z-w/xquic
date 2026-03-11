@@ -1087,6 +1087,25 @@ xqc_send_ctl_on_ack_received(xqc_send_ctl_t *send_ctl, xqc_pn_ctl_t *pn_ctl, xqc
         }
     }
 
+    xqc_usec_t adjusted_rtt = ack_recv_time - send_ctl->ctl_largest_acked_sent_time[pns];
+    xqc_usec_t ack_delay = ack_info->ack_delay;
+    if (adjusted_rtt > ack_delay
+        && (adjusted_rtt + 1000) >= (send_ctl->ctl_minrtt + ack_delay)) 
+    {
+        adjusted_rtt -= ack_delay;
+    }
+
+    xqc_usec_t response_interval = send_ctl->ctl_last_ack_recv_time > 0 
+        ? ack_recv_time - send_ctl->ctl_last_ack_recv_time : 0;
+    double loss_rate = xqc_conn_recent_loss_rate(conn);
+    uint64_t cwnd = send_ctl->ctl_cong_callback->xqc_cong_ctl_get_cwnd(send_ctl->ctl_cong);
+
+    xqc_log(conn->log, XQC_LOG_REPORT, 
+        "|timestamp:%ui|adjusted_rtt:%ui|loss_rate:%.2f|response_interval:%ui|cwnd:%ui|",
+        ack_recv_time, adjusted_rtt, loss_rate, response_interval, cwnd);
+
+    send_ctl->ctl_last_ack_recv_time = ack_recv_time;
+
     xqc_send_ctl_info_circle_record(send_ctl);
     xqc_log_event(conn->log, REC_METRICS_UPDATED, send_ctl);
     return XQC_OK;
