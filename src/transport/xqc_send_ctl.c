@@ -1097,12 +1097,13 @@ xqc_send_ctl_on_ack_received(xqc_send_ctl_t *send_ctl, xqc_pn_ctl_t *pn_ctl, xqc
 
     xqc_usec_t response_interval = send_ctl->ctl_last_ack_recv_time > 0 
         ? ack_recv_time - send_ctl->ctl_last_ack_recv_time : 0;
-    double loss_rate = xqc_conn_recent_loss_rate(conn);
+    double short_loss_rate = xqc_conn_recent_short_loss_rate(conn);
+    double long_loss_rate = xqc_conn_recent_long_loss_rate(conn);
     uint64_t cwnd = send_ctl->ctl_cong_callback->xqc_cong_ctl_get_cwnd(send_ctl->ctl_cong);
 
     xqc_log(conn->log, XQC_LOG_REPORT, 
-        "|timestamp:%ui|adjusted_rtt:%ui|loss_rate:%.2f|response_interval:%ui|cwnd:%ui|",
-        ack_recv_time, adjusted_rtt, loss_rate, response_interval, cwnd);
+        "|timestamp:%ui|adjusted_rtt:%ui|short_loss_rate:%.2f|long_loss_rate:%.2f|response_interval:%ui|cwnd:%ui|",
+        ack_recv_time, adjusted_rtt, short_loss_rate, long_loss_rate, response_interval, cwnd);
 
     send_ctl->ctl_last_ack_recv_time = ack_recv_time;
 

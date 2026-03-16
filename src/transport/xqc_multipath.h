@@ -262,6 +262,10 @@ double xqc_path_recent_loss_rate(xqc_path_ctx_t *path);
 
 double xqc_conn_recent_loss_rate(xqc_connection_t *conn);
 
+double xqc_conn_recent_short_loss_rate(xqc_connection_t *conn);
+
+double xqc_conn_recent_long_loss_rate(xqc_connection_t *conn);
+
 #endif /* XQC_MULTIPATH_H */
 
 

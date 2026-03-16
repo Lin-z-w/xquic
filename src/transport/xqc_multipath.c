@@ -1477,6 +1477,54 @@ xqc_conn_recent_loss_rate(xqc_connection_t *conn)
     return xqc_max(loss_rate0, loss_rate1);
 }
 
+double
+xqc_conn_recent_short_loss_rate(xqc_connection_t *conn)
+{
+    double loss_rate0;
+    unsigned lost_cnt0, send_cnt0;
+    xqc_path_ctx_t *path;
+    xqc_list_head_t *pos, *next;
+
+    lost_cnt0 = send_cnt0 = 0;
+
+    xqc_list_for_each_safe(pos, next, &conn->conn_paths_list) {
+        path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
+        lost_cnt0 += path->path_send_ctl->ctl_recent_lost_count[0];
+        send_cnt0 += path->path_send_ctl->ctl_recent_send_count[0];
+    }
+
+    if (send_cnt0) {
+        loss_rate0 = 100.0 * lost_cnt0 / send_cnt0;
+    }
+
+    return loss_rate0;
+}
+
+double
+xqc_conn_recent_long_loss_rate(xqc_connection_t *conn)
+{
+    double loss_rate = 0;
+    unsigned lost_cnt, send_cnt;
+    xqc_path_ctx_t *path;
+    xqc_list_head_t *pos, *next;
+
+    lost_cnt = send_cnt = 0;
+
+    xqc_list_for_each_safe(pos, next, &conn->conn_paths_list) {
+        path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
+        lost_cnt += path->path_send_ctl->ctl_recent_lost_count[0];
+        send_cnt += path->path_send_ctl->ctl_recent_send_count[0];
+        lost_cnt += path->path_send_ctl->ctl_recent_lost_count[1];
+        send_cnt += path->path_send_ctl->ctl_recent_send_count[1];
+    }
+
+    if (send_cnt) {
+        loss_rate = 100.0 * lost_cnt / send_cnt;
+    }
+
+    return loss_rate;
+}
+
 double 
 xqc_path_recent_loss_rate(xqc_path_ctx_t *path)
 {
