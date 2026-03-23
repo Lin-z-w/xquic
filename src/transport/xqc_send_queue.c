@@ -422,6 +422,7 @@ xqc_send_queue_drop_packets(xqc_connection_t *conn)
                 path->path_id, path->path_send_ctl->ctl_bytes_in_flight);
 
         path->path_send_ctl->ctl_bytes_in_flight = 0;
+        path->path_send_ctl->ctl_pkt_in_flight = 0;
         for (xqc_pkt_num_space_t pns = 0; pns < XQC_PNS_N; ++pns) {
             path->path_send_ctl->ctl_bytes_ack_eliciting_inflight[pns] = 0;
         }

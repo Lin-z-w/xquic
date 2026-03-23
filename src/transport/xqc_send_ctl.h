@@ -135,6 +135,7 @@ typedef struct xqc_send_ctl_s {
     uint8_t                     ctl_is_cwnd_limited;
 
     unsigned                    ctl_bytes_in_flight;
+    unsigned                    ctl_pkt_in_flight;
     uint32_t                    ctl_bytes_ack_eliciting_inflight[XQC_PNS_N];
     unsigned                    ctl_prior_bytes_in_flight;
 

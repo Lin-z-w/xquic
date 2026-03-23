@@ -199,6 +199,7 @@ xqc_send_ctl_destroy(xqc_send_ctl_t *send_ctl)
     }
 
     send_ctl->ctl_bytes_in_flight = 0;
+    send_ctl->ctl_pkt_in_flight = 0;
 }
 
 void
@@ -555,6 +556,7 @@ xqc_send_ctl_increase_inflight(xqc_connection_t *conn, xqc_packet_out_t *packet_
         if (XQC_IS_ACK_ELICITING(packet_out->po_frame_types)) {
             send_ctl->ctl_bytes_in_flight += packet_out->po_used_size;
             send_ctl->ctl_bytes_ack_eliciting_inflight[packet_out->po_pkt.pkt_pns] += packet_out->po_used_size;
+            send_ctl->ctl_pkt_in_flight++;
             packet_out->po_flag |= XQC_POF_IN_FLIGHT;
         }
     }
@@ -574,6 +576,7 @@ xqc_send_ctl_decrease_inflight(xqc_connection_t *conn, xqc_packet_out_t *packet_
         if (XQC_IS_ACK_ELICITING(packet_out->po_frame_types)) {
             send_ctl->ctl_bytes_ack_eliciting_inflight[packet_out->po_pkt.pkt_pns] = xqc_uint32_bounded_subtract(send_ctl->ctl_bytes_ack_eliciting_inflight[packet_out->po_pkt.pkt_pns], packet_out->po_used_size);
             send_ctl->ctl_bytes_in_flight = xqc_uint32_bounded_subtract(send_ctl->ctl_bytes_in_flight, packet_out->po_used_size);
+            send_ctl->ctl_pkt_in_flight = xqc_uint32_bounded_subtract(send_ctl->ctl_pkt_in_flight, 1);
             packet_out->po_flag &= ~XQC_POF_IN_FLIGHT;
         }
     }
@@ -1101,9 +1104,25 @@ xqc_send_ctl_on_ack_received(xqc_send_ctl_t *send_ctl, xqc_pn_ctl_t *pn_ctl, xqc
     double long_loss_rate = xqc_conn_recent_long_loss_rate(conn);
     uint64_t cwnd = send_ctl->ctl_cong_callback->xqc_cong_ctl_get_cwnd(send_ctl->ctl_cong);
 
+    /* calc short/long loss count and send count */
+    unsigned short_lost_cnt = 0, short_send_cnt = 0;
+    unsigned long_lost_cnt = 0, long_send_cnt = 0;
+    xqc_path_ctx_t *path;
+    xqc_list_for_each_safe(pos, next, &conn->conn_paths_list) {
+        path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
+        short_lost_cnt += path->path_send_ctl->ctl_recent_lost_count[0];
+        short_send_cnt += path->path_send_ctl->ctl_recent_send_count[0];
+        long_lost_cnt += path->path_send_ctl->ctl_recent_lost_count[0];
+        long_send_cnt += path->path_send_ctl->ctl_recent_send_count[0];
+        long_lost_cnt += path->path_send_ctl->ctl_recent_lost_count[1];
+        long_send_cnt += path->path_send_ctl->ctl_recent_send_count[1];
+    }
+
     xqc_log(conn->log, XQC_LOG_REPORT, 
-        "|timestamp:%ui|adjusted_rtt:%ui|short_loss_rate:%.2f|long_loss_rate:%.2f|response_interval:%ui|cwnd:%ui|",
-        ack_recv_time, adjusted_rtt, short_loss_rate, long_loss_rate, response_interval, cwnd);
+        "|timestamp:%ui|adjusted_rtt:%ui|short_loss_rate:%.2f|short_lost_cnt:%ui|short_send_cnt:%ui|long_loss_rate:%.2f|long_lost_cnt:%ui|long_send_cnt:%ui|response_interval:%ui|cwnd:%ui|pkt_in_fly:%ui|",
+        ack_recv_time, adjusted_rtt, short_loss_rate, short_lost_cnt, short_send_cnt, 
+        long_loss_rate, long_lost_cnt, long_send_cnt, response_interval, cwnd,
+        send_ctl->ctl_pkt_in_flight);
 
     send_ctl->ctl_last_ack_recv_time = ack_recv_time;
 
