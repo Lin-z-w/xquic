@@ -1032,6 +1032,9 @@ XQC_EXPORT_PUBLIC_API XQC_EXTERN const xqc_cong_ctrl_callback_t xqc_unlimited_cc
 #ifdef XQC_ENABLE_COPA
 XQC_EXPORT_PUBLIC_API XQC_EXTERN const xqc_cong_ctrl_callback_t xqc_copa_cb;
 #endif
+#ifdef XQC_ENABLE_ML_CC
+XQC_EXPORT_PUBLIC_API XQC_EXTERN const xqc_cong_ctrl_callback_t xqc_ml_cc_cb;
+#endif
 
 typedef enum xqc_scheduler_path_event_e {
     XQC_SCHED_EVENT_PATH_NOT_FULL = 0,

@@ -11,6 +11,7 @@ option (XQC_ENABLE_BBR2 "enable bbr2" OFF)
 option (XQC_ENABLE_COPA "enable copa" OFF)
 option (XQC_ENABLE_RENO "enable reno" OFF)
 option (XQC_ENABLE_UNLIMITED "enable unlimited cc" OFF)
+option (XQC_ENABLE_ML_CC "enable ML-based congestion control" OFF)
 option (XQC_ENABLE_MP_INTEROP "enable MPQUIC interop" OFF)
 option (XQC_NO_PID_PACKET_PROCESS "do not expose path_id in xqc_engine_packet_process" OFF)
 option (XQC_PROTECT_POOL_MEM "enable write protection for pool memory (for debug)" OFF)
@@ -378,6 +379,44 @@ if(XQC_ENABLE_UNLIMITED)
     )
 endif()
 
+if(XQC_ENABLE_ML_CC)
+    set(
+        CONGESTION_CONTROL_SOURCES
+        ${CONGESTION_CONTROL_SOURCES}
+        "src/congestion_control/xqc_ml_cc.c"
+    )
+
+    if(NOT ONNX_MODEL_DIR)
+        set(ONNX_MODEL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/queue_predict/deployment")
+    endif()
+
+    if(NOT ONNX_RUNTIME_DIR)
+        set(ONNX_RUNTIME_DIR "/usr/local")
+    endif()
+
+    set(ONNX_MODEL_PATH "${ONNX_MODEL_DIR}/queue_predictor.onnx")
+
+    add_definitions(-DXQC_ENABLE_ONNX)
+    add_definitions(-DXQC_ONNX_MODEL_DIR="${ONNX_MODEL_DIR}")
+    add_definitions(-DXQC_ONNX_MODEL_PATH="${ONNX_MODEL_PATH}")
+
+    find_path(ONNXRUNTIME_INCLUDE onnxruntime_c_api.h
+        PATHS ${ONNX_RUNTIME_DIR}/include
+        NO_DEFAULT_PATH)
+
+    if(ONNXRUNTIME_INCLUDE)
+        include_directories(${ONNXRUNTIME_INCLUDE})
+        find_library(ONNXRUNTIME_LIB onnxruntime PATHS ${ONNX_RUNTIME_DIR}/lib NO_DEFAULT_PATH)
+        if(ONNXRUNTIME_LIB)
+            message(STATUS "ONNX Runtime found: ${ONNXRUNTIME_LIB}")
+        else()
+            message(WARNING "ONNX Runtime library not found in ${ONNX_RUNTIME_DIR}/lib")
+        endif()
+    else()
+        message(WARNING "ONNX Runtime headers not found in ${ONNX_RUNTIME_DIR}/include")
+    endif()
+endif()
+
 
 # xquic source
 set (
@@ -422,6 +461,11 @@ else()
         "-Wl,--no-whole-archive"
         -lpthread
     )
+endif()
+
+if(XQC_ENABLE_ML_CC AND ONNXRUNTIME_LIB)
+    target_link_libraries(xquic ${ONNXRUNTIME_LIB})
+    target_link_libraries(xquic-static ${ONNXRUNTIME_LIB})
 endif()
 
 
