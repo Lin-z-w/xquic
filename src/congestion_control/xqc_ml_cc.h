@@ -9,11 +9,15 @@
 #include <xquic/xquic_typedef.h>
 #include "src/transport/xqc_send_ctl.h"
 
-#define XQC_ML_CC_WINDOW_SIZE  10
-#define XQC_ML_CC_NUM_FEATURES 18
-#define XQC_ML_CC_MSS          (XQC_MSS)
-#define XQC_ML_CC_INIT_WIN     (32 * XQC_ML_CC_MSS)
-#define XQC_ML_CC_MIN_CWND     (4 * XQC_ML_CC_MSS)
+#define XQC_ML_CC_WINDOW_SIZE           10
+#define XQC_ML_CC_NUM_FEATURES          18
+#define XQC_ML_CC_MSS                   (XQC_MSS)
+#define XQC_ML_CC_INIT_WIN              (32 * XQC_ML_CC_MSS)
+#define XQC_ML_CC_MIN_CWND              (4 * XQC_ML_CC_MSS)
+
+#define XQC_ML_CC_QUEUE_THRESHOLD_LOSS  70.0f
+#define XQC_ML_CC_QUEUE_THRESHOLD_K     80.0f
+#define XQC_ML_CC_RECOVERY_RTT          3
 
 typedef struct xqc_ml_cc_s {
     xqc_send_ctl_t         *send_ctl;
@@ -35,6 +39,10 @@ typedef struct xqc_ml_cc_s {
 
     int                     use_ml_prediction;
     float                   last_prediction;
+
+    xqc_usec_t             congestion_recovery_start_time;
+    xqc_usec_t             last_rtt;
+    float                   loss_reduction_factor;
 
 } xqc_ml_cc_t;
 

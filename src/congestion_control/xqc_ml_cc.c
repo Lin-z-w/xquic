@@ -405,11 +405,14 @@ xqc_ml_cc_feed_features(void *cong, xqc_usec_t ack_recv_time,
     xqc_ml_cc_update_window(ml_cc, &features);
 
     ml_cc->last_prediction = xqc_ml_cc_run_inference(ml_cc);
+    ml_cc->last_rtt = adjusted_rtt;
 
     xqc_log(ml_cc->log, XQC_LOG_REPORT,
-        "|ml_cc|feed_features|rtt:%.2f|loss:%.2f/%.2f|cwnd:%.0f|pkt_fly:%.0f|queue_pct:%.2f|",
+        "|ml_cc|feed_features|rtt:%.2f|loss:%.2f/%.2f|cwnd:%.0f|pkt_fly:%.0f|queue_pct:%.2f|recovery_elapsed:%ui|",
         features.adjusted_rtt, features.short_loss_rate, features.long_loss_rate,
-        features.cwnd, features.pkt_in_fly, ml_cc->last_prediction);
+        features.cwnd, features.pkt_in_fly, ml_cc->last_prediction,
+        (ml_cc->congestion_recovery_start_time > 0) ? 
+            (uint32_t)((xqc_monotonic_timestamp() - ml_cc->congestion_recovery_start_time) / 1000) : 0);
 }
 
 static size_t
@@ -439,6 +442,10 @@ xqc_ml_cc_init(void *cong, xqc_send_ctl_t *ctl_ctx, xqc_cc_params_t cc_params)
     ml_cc->sample_count = 0;
     ml_cc->last_prediction = 50.0f;
     ml_cc->use_ml_prediction = 1;
+
+    ml_cc->congestion_recovery_start_time = 0;
+    ml_cc->last_rtt = 0;
+    ml_cc->loss_reduction_factor = 0.0f;
 
     memset(ml_cc->history_window, 0, sizeof(ml_cc->history_window));
 
@@ -489,9 +496,12 @@ xqc_ml_cc_init(void *cong, xqc_send_ctl_t *ctl_ctx, xqc_cc_params_t cc_params)
 #endif
 
     xqc_log(ml_cc->log, XQC_LOG_DEBUG,
-            "|ml_cc|initialized|cwnd:%u|onnx:%d|",
+            "|ml_cc|initialized|cwnd:%u|onnx:%d|threshold_loss:%.1f|threshold_k:%.1f|recovery_rtt:%d|",
             (uint32_t)ml_cc->cwnd_bytes,
-            ml_cc->onnx_session != NULL ? 1 : 0);
+            ml_cc->onnx_session != NULL ? 1 : 0,
+            XQC_ML_CC_QUEUE_THRESHOLD_LOSS,
+            XQC_ML_CC_QUEUE_THRESHOLD_K,
+            XQC_ML_CC_RECOVERY_RTT);
 }
 
 static void
@@ -499,20 +509,37 @@ xqc_ml_cc_on_ack(void *cong, xqc_packet_out_t *po, xqc_usec_t now)
 {
     xqc_ml_cc_t *ml_cc = (xqc_ml_cc_t *)cong;
 
-    float queue_depth_pct = xqc_ml_cc_run_inference(ml_cc);
-    ml_cc->last_prediction = queue_depth_pct;
+    xqc_usec_t elapsed = 0;
+    if (ml_cc->congestion_recovery_start_time > 0) {
+        elapsed = now - ml_cc->congestion_recovery_start_time;
+    }
 
+    if (ml_cc->last_rtt > 0 && 
+        elapsed < ml_cc->last_rtt * XQC_ML_CC_RECOVERY_RTT) {
+        xqc_log(ml_cc->log, XQC_LOG_DEBUG,
+                "|ml_cc|on_ack|in_recovery|elapsed:%ui|recovery_window:%ui|cwnd:%u|",
+                (uint32_t)elapsed, 
+                (uint32_t)(ml_cc->last_rtt * XQC_ML_CC_RECOVERY_RTT),
+                (uint32_t)ml_cc->cwnd_bytes);
+        return;
+    }
+
+    float queue_pct = ml_cc->last_prediction;
     float cwnd_gain = 1.0f;
-    if (queue_depth_pct < 30.0f) {
-        cwnd_gain = 1.2f;
-    } else if (queue_depth_pct < 50.0f) {
-        cwnd_gain = 1.1f;
-    } else if (queue_depth_pct < 70.0f) {
+
+    if (queue_pct <= XQC_ML_CC_QUEUE_THRESHOLD_LOSS) {
         cwnd_gain = 1.0f;
-    } else if (queue_depth_pct < 85.0f) {
-        cwnd_gain = 0.9f;
+
+    } else if (queue_pct < XQC_ML_CC_QUEUE_THRESHOLD_K) {
+        float t = (queue_pct - XQC_ML_CC_QUEUE_THRESHOLD_LOSS) / 
+                  (XQC_ML_CC_QUEUE_THRESHOLD_K - XQC_ML_CC_QUEUE_THRESHOLD_LOSS);
+        cwnd_gain = 1.1f - t * 0.1f;
+
     } else {
-        cwnd_gain = 0.8f;
+        float t = (queue_pct - XQC_ML_CC_QUEUE_THRESHOLD_K) / 
+                  (100.0f - XQC_ML_CC_QUEUE_THRESHOLD_K);
+        cwnd_gain = 1.0f - t * 0.5f;
+        cwnd_gain = xqc_max(cwnd_gain, 0.5f);
     }
 
     float ack_bytes = 0.0f;
@@ -526,8 +553,11 @@ xqc_ml_cc_on_ack(void *cong, xqc_packet_out_t *po, xqc_usec_t now)
     ml_cc->cwnd_bytes = target_cwnd;
 
     xqc_log(ml_cc->log, XQC_LOG_DEBUG,
-            "|ml_cc|on_ack|queue_pct:%.2f|cwnd_gain:%.2f|cwnd:%u|ack_bytes:%u|",
-            queue_depth_pct, cwnd_gain, (uint32_t)ml_cc->cwnd_bytes, (uint32_t)ack_bytes);
+            "|ml_cc|on_ack|queue_pct:%.2f|gain:%.3f|cwnd:%u|ack_bytes:%u|recovery:%d|",
+            queue_pct, cwnd_gain, (uint32_t)ml_cc->cwnd_bytes, 
+            (uint32_t)ack_bytes, 
+            (ml_cc->congestion_recovery_start_time > 0 && 
+             elapsed < ml_cc->last_rtt * XQC_ML_CC_RECOVERY_RTT) ? 1 : 0);
 }
 
 static void
@@ -535,20 +565,30 @@ xqc_ml_cc_on_lost(void *cong, xqc_usec_t lost_sent_time)
 {
     xqc_ml_cc_t *ml_cc = (xqc_ml_cc_t *)cong;
 
-    float reduction_factor = 0.7f;
-    if (ml_cc->last_prediction > 85.0f) {
-        reduction_factor = 0.5f;
-    } else if (ml_cc->last_prediction > 70.0f) {
-        reduction_factor = 0.6f;
+    float queue_pct = ml_cc->last_prediction;
+
+    if (queue_pct > XQC_ML_CC_QUEUE_THRESHOLD_LOSS) {
+        float t = (queue_pct - XQC_ML_CC_QUEUE_THRESHOLD_LOSS) / 
+                  (100.0f - XQC_ML_CC_QUEUE_THRESHOLD_LOSS);
+        float reduction_factor = 0.7f + t * 0.25f;
+        reduction_factor = xqc_min(reduction_factor, 0.95f);
+
+        ml_cc->loss_reduction_factor = reduction_factor;
+        ml_cc->cwnd_bytes = xqc_max(
+            ml_cc->min_cwnd_bytes,
+            ml_cc->cwnd_bytes * reduction_factor);
+
+        ml_cc->congestion_recovery_start_time = xqc_monotonic_timestamp();
+
+        xqc_log(ml_cc->log, XQC_LOG_DEBUG,
+                "|ml_cc|on_lost|reduction:%.3f|cwnd:%u|queue_pct:%.2f|recovery_start|",
+                reduction_factor, (uint32_t)ml_cc->cwnd_bytes, queue_pct);
+
+    } else {
+        xqc_log(ml_cc->log, XQC_LOG_DEBUG,
+                "|ml_cc|on_lost|skip|cwnd:%u|queue_pct:%.2f|below_threshold|",
+                (uint32_t)ml_cc->cwnd_bytes, queue_pct);
     }
-
-    ml_cc->cwnd_bytes = xqc_max(
-        ml_cc->min_cwnd_bytes,
-        ml_cc->cwnd_bytes * reduction_factor);
-
-    xqc_log(ml_cc->log, XQC_LOG_DEBUG,
-            "|ml_cc|on_lost|reduction:%.2f|cwnd:%u|prediction:%.2f|",
-            reduction_factor, (uint32_t)ml_cc->cwnd_bytes, ml_cc->last_prediction);
 }
 
 static uint64_t
