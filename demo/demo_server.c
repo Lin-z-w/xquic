@@ -1503,6 +1503,14 @@ xqc_demo_svr_parse_args(int argc, char *argv[], xqc_demo_svr_args_t *args)
             case 'P':
                 args->net_cfg.cc = CC_TYPE_COPA;
                 break;
+            case 'm':
+#ifdef XQC_ENABLE_ML_CC
+                args->net_cfg.cc = CC_TYPE_ML;
+                printf("option cong_ctl : ml\n");
+#else
+                printf("ML CC not enabled, use -DXQC_ENABLE_ML_CC when building\n");
+#endif
+                break;
             default:
                 break;
             }
@@ -1711,6 +1719,11 @@ xqc_demo_svr_init_conn_settings(xqc_engine_t *engine, xqc_demo_svr_args_t *args)
 #ifdef XQC_ENABLE_RENO
     case CC_TYPE_RENO:
         ccc = xqc_reno_cb;
+        break;
+#endif
+#ifdef XQC_ENABLE_ML_CC
+    case CC_TYPE_ML:
+        ccc = xqc_ml_cc_cb;
         break;
 #endif
     default:
