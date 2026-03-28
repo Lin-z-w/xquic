@@ -60,6 +60,24 @@ xqc_ml_cc_clamp_float(float value, float min_value, float max_value)
     return value;
 }
 
+static const char *
+xqc_ml_cc_state_to_str(xqc_ml_cc_state_t state)
+{
+    switch (state) {
+    case XQC_ML_CC_STATE_UT:
+        return "UT";
+    case XQC_ML_CC_STATE_QU:
+        return "QU";
+    case XQC_ML_CC_STATE_EB:
+        return "EB";
+    case XQC_ML_CC_STATE_NH:
+        return "NH";
+    case XQC_ML_CC_STATE_NONE:
+    default:
+        return "NONE";
+    }
+}
+
 static void
 xqc_ml_cc_softmax(float *input, float *output, int length)
 {
@@ -512,8 +530,21 @@ xqc_ml_cc_feed_features(void *cong, xqc_usec_t ack_recv_time,
     xqc_ml_cc_update_window(ml_cc, features);
 
     if (!ml_cc->is_frozen) {
+        xqc_ml_cc_state_t prev_state = ml_cc->last_state;
         xqc_ml_cc_run_state_inference(ml_cc);
         ml_cc->last_state = xqc_ml_cc_determine_state(ml_cc);
+        xqc_log(ml_cc->log, XQC_LOG_DEBUG,
+                "|ml_cc|state_update|prev_state:%s|state:%s|"
+                "prob_ut:%.3f|prob_qu:%.3f|prob_eb:%.3f|prob_nh:%.3f|"
+                "adjusted_rtt:%ui|short_loss:%.2f|long_loss:%.2f|cwnd:%ui|pkt_in_fly:%ud|samples:%d|",
+                xqc_ml_cc_state_to_str(prev_state),
+                xqc_ml_cc_state_to_str(ml_cc->last_state),
+                ml_cc->state_probs[XQC_ML_CC_STATE_UT],
+                ml_cc->state_probs[XQC_ML_CC_STATE_QU],
+                ml_cc->state_probs[XQC_ML_CC_STATE_EB],
+                ml_cc->state_probs[XQC_ML_CC_STATE_NH],
+                adjusted_rtt, short_loss_rate, long_loss_rate, (uint32_t)cwnd,
+                pkt_in_fly, ml_cc->sample_count);
     }
 
     ml_cc->last_rtt = adjusted_rtt;
@@ -674,11 +705,19 @@ xqc_ml_cc_on_ack(void *cong, xqc_packet_out_t *po, xqc_usec_t now)
             && ml_cc->state_probs[XQC_ML_CC_STATE_QU] >= XQC_ML_CC_QU_CONFIDENCE_THRESHOLD
             && xqc_ml_cc_run_qu_queue_inference(ml_cc, &queue_depth))
         {
+            float prev_queue_ema = ml_cc->queue_depth_ema;
             ml_cc->queue_depth_raw = queue_depth;
             ml_cc->queue_depth_ema = xqc_ml_cc_clamp_float(
                 (1.0f - XQC_ML_CC_QU_QUEUE_EMA_ALPHA) * ml_cc->queue_depth_ema
                 + XQC_ML_CC_QU_QUEUE_EMA_ALPHA * queue_depth,
                 0.0f, 1.0f);
+            xqc_log(ml_cc->log, XQC_LOG_DEBUG,
+                    "|ml_cc|queue_update|state:%s|prob_qu:%.3f|queue_raw:%.3f|"
+                    "queue_ema_prev:%.3f|queue_ema:%.3f|queue_k:%.3f|",
+                    xqc_ml_cc_state_to_str(ml_cc->last_state),
+                    ml_cc->state_probs[XQC_ML_CC_STATE_QU],
+                    ml_cc->queue_depth_raw, prev_queue_ema,
+                    ml_cc->queue_depth_ema, ml_cc->queue_threshold_k);
             xqc_ml_cc_apply_qu_fine_grained_control(ml_cc, po);
         } else {
             xqc_ml_cc_apply_qu_fallback(ml_cc);
