@@ -23,6 +23,20 @@
 #include "src/transport/xqc_datagram.h"
 #include "src/transport/xqc_reinjection.h"
 
+static xqc_bool_t
+xqc_send_ctl_is_ml_cc(xqc_send_ctl_t *send_ctl)
+{
+    const xqc_cong_ctrl_callback_t *cb = send_ctl->ctl_cong_callback;
+
+    if (cb == NULL) {
+        return XQC_FALSE;
+    }
+
+    return cb->xqc_cong_ctl_init == xqc_ml_cc_cb.xqc_cong_ctl_init
+        && cb->xqc_cong_ctl_on_ack == xqc_ml_cc_cb.xqc_cong_ctl_on_ack
+        && cb->xqc_cong_ctl_get_cwnd == xqc_ml_cc_cb.xqc_cong_ctl_get_cwnd;
+}
+
 int 
 xqc_send_ctl_may_remove_unacked_dgram(xqc_connection_t *conn, xqc_packet_out_t *po)
 {
@@ -1125,7 +1139,7 @@ xqc_send_ctl_on_ack_received(xqc_send_ctl_t *send_ctl, xqc_pn_ctl_t *pn_ctl, xqc
         long_loss_rate, long_lost_cnt, long_send_cnt, response_interval, cwnd,
         send_ctl->ctl_pkt_in_flight);
 
-    if (send_ctl->ctl_cong_callback == &xqc_ml_cc_cb) {
+    if (xqc_send_ctl_is_ml_cc(send_ctl)) {
         xqc_ml_cc_feed_features(send_ctl->ctl_cong, ack_recv_time,
             adjusted_rtt, short_loss_rate, short_lost_cnt, short_send_cnt,
             long_loss_rate, long_lost_cnt, long_send_cnt,
