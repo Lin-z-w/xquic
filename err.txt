@@ -1,0 +1,106 @@
+[ 72%] Building C object CMakeFiles/xquic.dir/src/congestion_control/xqc_ml_cc.c.o
+In file included from /home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c:12:
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.h:34:11: error: unknown type name ‘OrtApi’
+   34 |     const OrtApi           *onnx_api;
+      |           ^~~~~~
+In file included from /home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c:12:
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.h:34:11: error: unknown type name ‘OrtApi’
+   34 |     const OrtApi           *onnx_api;
+      |           ^~~~~~
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c: In function ‘xqc_ml_cc_run_inference’:
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c:261:20: error: request for member ‘CreateMemoryInfo’ in something not a structure or union
+  261 |     ml_cc->onnx_api->CreateMemoryInfo("Cpu", OrtArenaAllocator, 0, OrtMemTypeDefault, &mem_info);
+      |                    ^~
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c:264:40: error: request for member ‘CreateTensorWithDataAsOrtValue’ in something not a structure or union
+  264 |     OrtStatus *status = ml_cc->onnx_api->CreateTensorWithDataAsOrtValue(
+      |                                        ^~
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c:274:20: error: request for member ‘ReleaseMemoryInfo’ in something not a structure or union
+  274 |     ml_cc->onnx_api->ReleaseMemoryInfo(mem_info);
+      |                    ^~
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c:277:24: error: request for member ‘ReleaseStatus’ in something not a structure or union
+  277 |         ml_cc->onnx_api->ReleaseStatus(status);
+      |                        ^~
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c:285:29: error: request for member ‘Run’ in something not a structure or union
+  285 |     status = ml_cc->onnx_api->Run(
+      |                             ^~
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c:296:20: error: request for member ‘ReleaseValue’ in something not a structure or union
+  296 |     ml_cc->onnx_api->ReleaseValue(input_tensor);
+      |                    ^~
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c:299:24: error: request for member ‘ReleaseStatus’ in something not a structure or union
+  299 |         ml_cc->onnx_api->ReleaseStatus(status);
+      |                        ^~
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c:304:20: error: request for member ‘GetTensorMutableData’ in something not a structure or union
+  304 |     ml_cc->onnx_api->GetTensorMutableData(output_tensor, (void **)&output_data);
+      |                    ^~
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c:307:20: error: request for member ‘ReleaseValue’ in something not a structure or union
+  307 |     ml_cc->onnx_api->ReleaseValue(output_tensor);
+      |                    ^~
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c: In function ‘xqc_ml_cc_init’:
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c:370:47: error: ‘ORT_API_API’ undeclared (first use in this function); did you mean ‘ORT_API_CALL’?
+  370 |     ml_cc->onnx_api = OrtGetApiBase()->GetApi(ORT_API_API);
+      |                                               ^~~~~~~~~~~
+      |                                               ORT_API_CALL
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c:370:47: note: each undeclared identifier is reported only once for each function it appears in
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c:375:44: error: request for member ‘CreateEnv’ in something not a structure or union
+  375 |         OrtStatus *status = ml_cc->onnx_api->CreateEnv(
+      |                                            ^~
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c:379:37: error: request for member ‘CreateSession’ in something not a structure or union
+  379 |             status = ml_cc->onnx_api->CreateSession(
+      |                                     ^~
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c:387:28: error: request for member ‘ReleaseEnv’ in something not a structure or union
+  387 |             ml_cc->onnx_api->ReleaseEnv(env);
+      |                            ^~
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c: In function ‘xqc_ml_cc_run_inference’:
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c:261:20: error: request for member ‘CreateMemoryInfo’ in something not a structure or union
+  261 |     ml_cc->onnx_api->CreateMemoryInfo("Cpu", OrtArenaAllocator, 0, OrtMemTypeDefault, &mem_info);
+      |                    ^~
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c:264:40: error: request for member ‘CreateTensorWithDataAsOrtValue’ in something not a structure or union
+  264 |     OrtStatus *status = ml_cc->onnx_api->CreateTensorWithDataAsOrtValue(
+      |                                        ^~
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c:274:20: error: request for member ‘ReleaseMemoryInfo’ in something not a structure or union
+  274 |     ml_cc->onnx_api->ReleaseMemoryInfo(mem_info);
+      |                    ^~
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c:277:24: error: request for member ‘ReleaseStatus’ in something not a structure or union
+  277 |         ml_cc->onnx_api->ReleaseStatus(status);
+      |                        ^~
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c:285:29: error: request for member ‘Run’ in something not a structure or union
+  285 |     status = ml_cc->onnx_api->Run(
+      |                             ^~
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c:296:20: error: request for member ‘ReleaseValue’ in something not a structure or union
+  296 |     ml_cc->onnx_api->ReleaseValue(input_tensor);
+      |                    ^~
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c:299:24: error: request for member ‘ReleaseStatus’ in something not a structure or union
+  299 |         ml_cc->onnx_api->ReleaseStatus(status);
+      |                        ^~
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c:304:20: error: request for member ‘GetTensorMutableData’ in something not a structure or union
+  304 |     ml_cc->onnx_api->GetTensorMutableData(output_tensor, (void **)&output_data);
+      |                    ^~
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c:307:20: error: request for member ‘ReleaseValue’ in something not a structure or union
+  307 |     ml_cc->onnx_api->ReleaseValue(output_tensor);
+      |                    ^~
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c: In function ‘xqc_ml_cc_init’:
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c:370:47: error: ‘ORT_API_API’ undeclared (first use in this function); did you mean ‘ORT_API_CALL’?
+  370 |     ml_cc->onnx_api = OrtGetApiBase()->GetApi(ORT_API_API);
+      |                                               ^~~~~~~~~~~
+      |                                               ORT_API_CALL
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c:370:47: note: each undeclared identifier is reported only once for each function it appears in
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c:375:44: error: request for member ‘CreateEnv’ in something not a structure or union
+  375 |         OrtStatus *status = ml_cc->onnx_api->CreateEnv(
+      |                                            ^~
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c:379:37: error: request for member ‘CreateSession’ in something not a structure or union
+  379 |             status = ml_cc->onnx_api->CreateSession(
+      |                                     ^~
+/home/cnic/lzw/xquic/src/congestion_control/xqc_ml_cc.c:387:28: error: request for member ‘ReleaseEnv’ in something not a structure or union
+  387 |             ml_cc->onnx_api->ReleaseEnv(env);
+      |                            ^~
+make[2]: *** [CMakeFiles/xquic.dir/build.make:1182: CMakeFiles/xquic.dir/src/congestion_control/xqc_ml_cc.c.o] Error 1
+make[2]: *** Waiting for unfinished jobs....
+make[2]: *** [CMakeFiles/xquic-static.dir/build.make:1182: CMakeFiles/xquic-static.dir/src/congestion_control/xqc_ml_cc.c.o] Error 1
+make[2]: *** Waiting for unfinished jobs....
+make[1]: *** [CMakeFiles/Makefile2:147: CMakeFiles/xquic-static.dir/all] Error 2
+make[1]: *** Waiting for unfinished jobs....
+make[1]: *** [CMakeFiles/Makefile2:173: CMakeFiles/xquic.dir/all] Error 2
+make: *** [Makefile:91: all] Error 2
+
+
+2026-03-26 03:09:31.583938655 [W:onnxruntime:xqc_ml_cc, device_discovery.cc:132 GetPciBusId] Skipping pci_bus_id for PCI path at "/sys/devices/pci0000:00/0000:00:01.0/virtio0" because filename ""virtio0"" dit not match expected pattern of [0-9a-f]+:[0-9a-f]+:[0-9a-f]+[.][0-9a-f]+

@@ -1628,6 +1628,7 @@ typedef struct xqc_conn_stats_s {
 
     uint32_t            fec_recover_pkt_cnt;
     xqc_usec_t          avg_close_time;
+    uint64_t            bytes_send;
 } xqc_conn_stats_t;
 
 typedef struct xqc_conn_qos_stats_s {

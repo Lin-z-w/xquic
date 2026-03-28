@@ -213,6 +213,7 @@ typedef struct xqc_demo_svr_ctx_s {
     uint64_t            bw_last_bytes;
     uint64_t            total_send_bytes;
     int                 iperf_fd;
+    xqc_cid_t           current_cid;
 
     /* transfer duration control */
     struct event        *ev_transfer_stop;
@@ -466,6 +467,11 @@ xqc_demo_svr_hq_conn_create_notify(xqc_hq_conn_t *hqc, const xqc_cid_t *cid, voi
     /* set ctx */
     user_conn->ctx = &svr_ctx;
     memcpy(&user_conn->cid, cid, sizeof(*cid));
+
+    /* save cid for bandwidth report on first connection */
+    if (svr_ctx.bw_report_start_time == 0) {
+        memcpy(&svr_ctx.current_cid, cid, sizeof(*cid));
+    }
 
     /* set addr info */
     xqc_hq_conn_get_peer_addr(hqc, (struct sockaddr *)&user_conn->peer_addr, 
@@ -754,6 +760,11 @@ xqc_demo_svr_h3_conn_create_notify(xqc_h3_conn_t *h3_conn, const xqc_cid_t *cid,
     xqc_demo_svr_user_conn_t *user_conn = calloc(1, sizeof(xqc_demo_svr_user_conn_t));
     user_conn->ctx = &svr_ctx;
     xqc_h3_conn_set_user_data(h3_conn, user_conn);
+
+    /* save cid for bandwidth report on first connection */
+    if (svr_ctx.bw_report_start_time == 0) {
+        memcpy(&svr_ctx.current_cid, cid, sizeof(*cid));
+    }
 
 /*
     printf("xqc_demo_svr_h3_conn_create_notify, user_conn: %p, h3_conn: %p, ctx: %p\n", user_conn,
@@ -1353,19 +1364,19 @@ xqc_demo_svr_bw_report_callback(int fd, short what, void *arg)
         ctx->bw_last_bytes = 0;
     }
 
-    uint64_t total_bytes = ctx->total_send_bytes;
+    xqc_conn_stats_t stats = xqc_conn_get_stats(ctx->engine, &ctx->current_cid);
+    uint64_t total_bytes = stats.bytes_send;
 
     if (total_bytes > 0) {
         uint64_t interval_bytes = total_bytes - ctx->bw_last_bytes;
         
-        // double interval_start = (ctx->bw_last_report_time - ctx->bw_report_start_time) / 1000.0;
-        // double interval_end = (now - ctx->bw_report_start_time) / 1000.0;
-        double interval_start = ctx->bw_last_report_time;
-        double interval_end = now;
+        double interval_start = (ctx->bw_last_report_time - ctx->bw_report_start_time) / 1000000.0;
+        double interval_end = (now - ctx->bw_report_start_time) / 1000000.0;
 
         double transfer_mb = interval_bytes / (1024.0 * 1024.0);
-        double bandwidth_mbps = (ctx->args->env_cfg.report_interval > 0) ?
-            (interval_bytes * 8.0 / ctx->args->env_cfg.report_interval / 1024.0 / 1024.0) : 0;
+        double actual_interval_sec = (now - ctx->bw_last_report_time) / 1000000.0;
+        double bandwidth_mbps = (actual_interval_sec > 0) ?
+            (interval_bytes * 8.0 / actual_interval_sec / 1024.0 / 1024.0) : 0;
 
         if (ctx->iperf_fd > 0) {
             char iperf_line[256];

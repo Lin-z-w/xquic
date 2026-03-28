@@ -3702,6 +3702,7 @@ xqc_conn_get_stats_internal(xqc_connection_t *conn, xqc_conn_stats_t *conn_stats
         conn_stats->inflight_bytes       += send_ctl->ctl_bytes_in_flight;
         conn_stats->total_rebind_count   += path->rebinding_count;
         conn_stats->total_rebind_valid   += path->rebinding_valid;
+        conn_stats->bytes_send            += send_ctl->ctl_bytes_send;
     }
 
     /* 路径信息 */
