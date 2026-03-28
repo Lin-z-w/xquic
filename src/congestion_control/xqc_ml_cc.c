@@ -18,6 +18,7 @@
 
 #define XQC_ML_CC_USEC2SEC  1000000.0
 #define XQC_ML_CC_MAX_CWND  (1024 * 1024 * 1024)
+#define XQC_ML_CC_EPSILON   1e-6f
 
 const float xqc_ml_cc_scaler_mean[XQC_ML_CC_NUM_FEATURES] = {
     8.96128915e+04f, 6.79938659e+00f, 1.30212317e+02f, 1.61393684e+03f,
@@ -33,255 +34,122 @@ const float xqc_ml_cc_scaler_scale[XQC_ML_CC_NUM_FEATURES] = {
     2.20059070e-04f, 2.61691161e+03f, 9.01346935e+00f
 };
 
+const float xqc_ml_cc_qu_scaler_mean[XQC_ML_CC_NUM_FEATURES] = {
+    8.96128915e+04f, 6.79938659e+00f, 1.30212317e+02f, 1.61393684e+03f,
+    6.74786114e+00f, 3.83006478e+02f, 4.73249606e+03f, 3.85382679e+03f,
+    1.62961778e+06f, 6.50594380e+02f, 1.62115443e+00f, 1.00222519e+00f,
+    5.18842275e-04f, 1.89891871e+03f, 5.15254543e-02f
+};
+
+const float xqc_ml_cc_qu_scaler_scale[XQC_ML_CC_NUM_FEATURES] = {
+    5.86602124e+04f, 1.58179157e+01f, 4.45019329e+02f, 1.69024452e+03f,
+    1.32390146e+01f, 9.93498002e+02f, 3.69058068e+03f, 1.17108226e+04f,
+    1.48773062e+06f, 5.11887834e+02f, 5.66852703e+03f, 7.30771491e-02f,
+    2.20059070e-04f, 2.61691161e+03f, 9.01346935e+00f
+};
+
+static float
+xqc_ml_cc_clamp_float(float value, float min_value, float max_value)
+{
+    if (value < min_value) {
+        return min_value;
+    }
+    if (value > max_value) {
+        return max_value;
+    }
+    return value;
+}
+
 static void
 xqc_ml_cc_softmax(float *input, float *output, int length)
 {
     float max_val = input[0];
-    for (int i = 1; i < length; i++) {
+    float sum = 0.0f;
+    int i;
+
+    for (i = 1; i < length; i++) {
         if (input[i] > max_val) {
             max_val = input[i];
         }
     }
 
-    float sum = 0.0f;
-    for (int i = 0; i < length; i++) {
+    for (i = 0; i < length; i++) {
         sum += expf(input[i] - max_val);
     }
 
-    for (int i = 0; i < length; i++) {
+    if (sum <= XQC_ML_CC_EPSILON) {
+        for (i = 0; i < length; i++) {
+            output[i] = 1.0f / length;
+        }
+        return;
+    }
+
+    for (i = 0; i < length; i++) {
         output[i] = expf(input[i] - max_val) / sum;
     }
 }
 
 static void
-xqc_ml_cc_normalize_features(float *normalized, float *raw, int size)
+xqc_ml_cc_set_uniform_probs(xqc_ml_cc_t *ml_cc)
 {
-    for (int i = 0; i < size; i++) {
-        if (xqc_ml_cc_scaler_scale[i] > 1e-6f) {
-            normalized[i] = (raw[i] - xqc_ml_cc_scaler_mean[i]) / xqc_ml_cc_scaler_scale[i];
+    int i;
+    for (i = 0; i < 4; i++) {
+        ml_cc->state_probs[i] = 0.25f;
+    }
+}
+
+static void
+xqc_ml_cc_normalize_feature_row(float *normalized, const float *raw,
+    const float *mean, const float *scale, int size)
+{
+    int i;
+    for (i = 0; i < size; i++) {
+        if (scale[i] > XQC_ML_CC_EPSILON) {
+            normalized[i] = (raw[i] - mean[i]) / scale[i];
         } else {
-            normalized[i] = raw[i] - xqc_ml_cc_scaler_mean[i];
+            normalized[i] = raw[i] - mean[i];
         }
     }
 }
 
 static void
-xqc_ml_cc_extract_features(xqc_ml_cc_t *ml_cc, float *features)
+xqc_ml_cc_fill_input_window(xqc_ml_cc_t *ml_cc,
+    float input[1][XQC_ML_CC_WINDOW_SIZE][XQC_ML_CC_NUM_FEATURES],
+    const float *mean, const float *scale)
 {
-    xqc_send_ctl_t *ctl = ml_cc->send_ctl;
-    if (!ctl) {
-        memset(features, 0, XQC_ML_CC_NUM_FEATURES * sizeof(float));
-        return;
-    }
+    int start_idx, t, f;
 
-    float adjusted_rtt = (float)ctl->ctl_srtt / 1000.0f;
-    float cwnd_bytes = ml_cc->cwnd_bytes;
-    float pkt_in_fly = (float)ctl->ctl_bytes_in_flight;
+    start_idx = (ml_cc->window_idx - XQC_ML_CC_WINDOW_SIZE + XQC_ML_CC_WINDOW_SIZE)
+        % XQC_ML_CC_WINDOW_SIZE;
 
-    float short_lost_cnt = (float)ctl->ctl_recent_lost_count[0];
-    float short_send_cnt = (float)ctl->ctl_recent_send_count[0];
-    float short_loss_rate = (short_send_cnt > 0) ? (short_lost_cnt / short_send_cnt * 100.0f) : 0.0f;
-
-    float long_lost_cnt = (float)(ctl->ctl_recent_lost_count[0] + ctl->ctl_recent_lost_count[1]);
-    float long_send_cnt = (float)(ctl->ctl_recent_send_count[0] + ctl->ctl_recent_send_count[1]);
-    float long_loss_rate = (long_send_cnt > 0) ? (long_lost_cnt / long_send_cnt * 100.0f) : 0.0f;
-
-    float response_interval = 0.0f;
-    if (ctl->ctl_delivered_time > 0 && ctl->ctl_first_sent_time > 0) {
-        response_interval = (float)(ctl->ctl_delivered_time - ctl->ctl_first_sent_time) / 1000.0f;
-    }
-
-    float prev_rtt = 0.0f, prev_cwnd = 0.0f;
-    if (ml_cc->sample_count > 0) {
-        int prev_idx = (ml_cc->window_idx - 1 + XQC_ML_CC_WINDOW_SIZE) % XQC_ML_CC_WINDOW_SIZE;
-        prev_rtt = ml_cc->history_window[prev_idx][0];
-        prev_cwnd = ml_cc->history_window[prev_idx][8];
-    }
-
-    float rtt_diff = adjusted_rtt - prev_rtt;
-
-    float eps = 1e-8f;
-    float cwnd_change = cwnd_bytes / (prev_cwnd + eps);
-    if (cwnd_change < 0.1f) cwnd_change = 0.1f;
-    if (cwnd_change > 10.0f) cwnd_change = 10.0f;
-
-    float pkt_ratio = pkt_in_fly / (cwnd_bytes + eps);
-    if (pkt_ratio < 0.0f) pkt_ratio = 0.0f;
-    if (pkt_ratio > 2.0f) pkt_ratio = 2.0f;
-
-    float throughput_est = short_send_cnt / (response_interval / 1000.0f + eps);
-    if (throughput_est < 0.0f) throughput_est = 0.0f;
-    if (throughput_est > 10000.0f) throughput_est = 10000.0f;
-
-    float loss_rate_diff = short_loss_rate - long_loss_rate;
-    if (loss_rate_diff < -100.0f) loss_rate_diff = -100.0f;
-    if (loss_rate_diff > 100.0f) loss_rate_diff = 100.0f;
-
-    features[0] = adjusted_rtt;
-    features[1] = short_loss_rate;
-    features[2] = short_lost_cnt;
-    features[3] = short_send_cnt;
-    features[4] = long_loss_rate;
-    features[5] = long_lost_cnt;
-    features[6] = long_send_cnt;
-    features[7] = response_interval;
-    features[8] = cwnd_bytes;
-    features[9] = pkt_in_fly;
-    features[10] = rtt_diff;
-    features[11] = cwnd_change;
-    features[12] = pkt_ratio;
-    features[13] = throughput_est;
-    features[14] = loss_rate_diff;
-}
-
-static void
-xqc_ml_cc_update_window(xqc_ml_cc_t *ml_cc, float *features)
-{
-    float *row = ml_cc->history_window[ml_cc->window_idx];
-    for (int i = 0; i < XQC_ML_CC_NUM_FEATURES; i++) {
-        row[i] = features[i];
-    }
-    ml_cc->window_idx = (ml_cc->window_idx + 1) % XQC_ML_CC_WINDOW_SIZE;
-    ml_cc->sample_count++;
-}
-
-#ifdef XQC_ENABLE_ONNX
-static void
-xqc_ml_cc_run_inference(xqc_ml_cc_t *ml_cc)
-{
-    if (!ml_cc->onnx_session || !ml_cc->onnx_api) {
-        ml_cc->state_probs[0] = 0.25f;
-        ml_cc->state_probs[1] = 0.25f;
-        ml_cc->state_probs[2] = 0.25f;
-        ml_cc->state_probs[3] = 0.25f;
-        return;
-    }
-
-    if (ml_cc->sample_count < XQC_ML_CC_WINDOW_SIZE) {
-        ml_cc->state_probs[0] = 0.25f;
-        ml_cc->state_probs[1] = 0.25f;
-        ml_cc->state_probs[2] = 0.25f;
-        ml_cc->state_probs[3] = 0.25f;
-        return;
-    }
-
-    float input[1][XQC_ML_CC_WINDOW_SIZE][XQC_ML_CC_NUM_FEATURES];
-    int start_idx = (ml_cc->window_idx - XQC_ML_CC_WINDOW_SIZE + XQC_ML_CC_WINDOW_SIZE) % XQC_ML_CC_WINDOW_SIZE;
-    for (int t = 0; t < XQC_ML_CC_WINDOW_SIZE; t++) {
+    for (t = 0; t < XQC_ML_CC_WINDOW_SIZE; t++) {
         int src_idx = (start_idx + t) % XQC_ML_CC_WINDOW_SIZE;
-        for (int f = 0; f < XQC_ML_CC_NUM_FEATURES; f++) {
-            input[0][t][f] = ml_cc->history_window[src_idx][f];
+        xqc_ml_cc_normalize_feature_row(input[0][t], ml_cc->history_window[src_idx],
+            mean, scale, XQC_ML_CC_NUM_FEATURES);
+        for (f = 0; f < XQC_ML_CC_NUM_FEATURES; f++) {
+            if (!isfinite(input[0][t][f])) {
+                input[0][t][f] = 0.0f;
+            }
         }
     }
-
-    const OrtApi *api = (const OrtApi *)ml_cc->onnx_api;
-    OrtSession *session = (OrtSession *)ml_cc->onnx_session;
-
-    int64_t input_shape[] = {1, XQC_ML_CC_WINDOW_SIZE, XQC_ML_CC_NUM_FEATURES};
-    OrtMemoryInfo *mem_info = NULL;
-    OrtStatus *status = api->CreateMemoryInfo("Cpu", OrtArenaAllocator, 0, OrtMemTypeDefault, &mem_info);
-    if (status != NULL) {
-        api->ReleaseStatus(status);
-        return;
-    }
-
-    OrtValue *input_tensor = NULL;
-    status = api->CreateTensorWithDataAsOrtValue(
-        mem_info,
-        input[0],
-        sizeof(input),
-        input_shape,
-        3,
-        ONNX_TYPE_TENSOR,
-        &input_tensor
-    );
-    api->ReleaseMemoryInfo(mem_info);
-
-    if (status != NULL) {
-        api->ReleaseStatus(status);
-        return;
-    }
-
-    const char *input_names[] = {"input"};
-    const char *output_names[] = {"output"};
-    OrtValue *output_tensor = NULL;
-
-    status = api->Run(
-        session,
-        NULL,
-        input_names,
-        (const OrtValue *[]){input_tensor},
-        1,
-        output_names,
-        1,
-        &output_tensor
-    );
-
-    api->ReleaseValue(input_tensor);
-
-    if (status != NULL) {
-        api->ReleaseStatus(status);
-        return;
-    }
-
-    float *output_data = NULL;
-    status = api->GetTensorMutableData(output_tensor, (void **)&output_data);
-    if (status == NULL && output_data != NULL) {
-        float logits[4] = {output_data[0], output_data[1], output_data[2], output_data[3]};
-        xqc_ml_cc_softmax(logits, ml_cc->state_probs, 4);
-    } else {
-        ml_cc->state_probs[0] = 0.25f;
-        ml_cc->state_probs[1] = 0.25f;
-        ml_cc->state_probs[2] = 0.25f;
-        ml_cc->state_probs[3] = 0.25f;
-    }
-
-    api->ReleaseValue(output_tensor);
 }
-#else
+
 static void
-xqc_ml_cc_run_inference(xqc_ml_cc_t *ml_cc)
-{
-    ml_cc->state_probs[0] = 0.25f;
-    ml_cc->state_probs[1] = 0.25f;
-    ml_cc->state_probs[2] = 0.25f;
-    ml_cc->state_probs[3] = 0.25f;
-}
-#endif
-
-static xqc_ml_cc_state_t
-xqc_ml_cc_determine_state(xqc_ml_cc_t *ml_cc)
-{
-    if (ml_cc->state_probs[3] > XQC_ML_CC_NH_THRESHOLD) {
-        return XQC_ML_CC_STATE_NH;
-    }
-
-    float max_prob = ml_cc->state_probs[0];
-    int max_idx = 0;
-    for (int i = 1; i < 4; i++) {
-        if (ml_cc->state_probs[i] > max_prob) {
-            max_prob = ml_cc->state_probs[i];
-            max_idx = i;
-        }
-    }
-
-    return (xqc_ml_cc_state_t)max_idx;
-}
-
-void
-xqc_ml_cc_feed_features(void *cong, xqc_usec_t ack_recv_time,
+xqc_ml_cc_build_features(xqc_ml_cc_t *ml_cc, float *features,
     xqc_usec_t adjusted_rtt, double short_loss_rate, unsigned short_lost_cnt,
     unsigned short_send_cnt, double long_loss_rate, unsigned long_lost_cnt,
     unsigned long_send_cnt, xqc_usec_t response_interval, uint64_t cwnd,
     unsigned pkt_in_fly)
 {
-    xqc_ml_cc_t *ml_cc = (xqc_ml_cc_t *)cong;
-    if (!ml_cc) {
-        return;
-    }
+    float prev_rtt = 0.0f;
+    float prev_cwnd = 0.0f;
+    float eps = 1e-8f;
 
-    float features[XQC_ML_CC_NUM_FEATURES];
-    memset(features, 0, sizeof(features));
+    if (ml_cc->sample_count > 0) {
+        int prev_idx = (ml_cc->window_idx - 1 + XQC_ML_CC_WINDOW_SIZE) % XQC_ML_CC_WINDOW_SIZE;
+        prev_rtt = ml_cc->history_window[prev_idx][0];
+        prev_cwnd = ml_cc->history_window[prev_idx][8];
+    }
 
     features[0] = (float)adjusted_rtt / 1000.0f;
     features[1] = (float)short_loss_rate;
@@ -293,37 +161,358 @@ xqc_ml_cc_feed_features(void *cong, xqc_usec_t ack_recv_time,
     features[7] = (float)response_interval / 1000.0f;
     features[8] = (float)cwnd;
     features[9] = (float)pkt_in_fly;
-
-    float prev_rtt = 0.0f, prev_cwnd = 0.0f;
-    if (ml_cc->sample_count > 0) {
-        int prev_idx = (ml_cc->window_idx - 1 + XQC_ML_CC_WINDOW_SIZE) % XQC_ML_CC_WINDOW_SIZE;
-        prev_rtt = ml_cc->history_window[prev_idx][0];
-        prev_cwnd = ml_cc->history_window[prev_idx][8];
-    }
-
     features[10] = features[0] - prev_rtt;
 
-    float eps = 1e-8f;
     features[11] = features[8] / (prev_cwnd + eps);
-    if (features[11] < 0.1f) features[11] = 0.1f;
-    if (features[11] > 10.0f) features[11] = 10.0f;
+    features[11] = xqc_ml_cc_clamp_float(features[11], 0.1f, 10.0f);
 
     features[12] = features[9] / (features[8] + eps);
-    if (features[12] < 0.0f) features[12] = 0.0f;
-    if (features[12] > 2.0f) features[12] = 2.0f;
+    features[12] = xqc_ml_cc_clamp_float(features[12], 0.0f, 2.0f);
 
     features[13] = features[3] / (features[7] / 1000.0f + eps);
-    if (features[13] < 0.0f) features[13] = 0.0f;
-    if (features[13] > 10000.0f) features[13] = 10000.0f;
+    features[13] = xqc_ml_cc_clamp_float(features[13], 0.0f, 10000.0f);
 
     features[14] = features[1] - features[4];
-    if (features[14] < -100.0f) features[14] = -100.0f;
-    if (features[14] > 100.0f) features[14] = 100.0f;
+    features[14] = xqc_ml_cc_clamp_float(features[14], -100.0f, 100.0f);
+}
+
+static void
+xqc_ml_cc_update_window(xqc_ml_cc_t *ml_cc, float *features)
+{
+    int i;
+    float *row = ml_cc->history_window[ml_cc->window_idx];
+
+    for (i = 0; i < XQC_ML_CC_NUM_FEATURES; i++) {
+        row[i] = features[i];
+    }
+
+    ml_cc->window_idx = (ml_cc->window_idx + 1) % XQC_ML_CC_WINDOW_SIZE;
+    ml_cc->sample_count++;
+}
+
+static float
+xqc_ml_cc_get_acked_bytes(xqc_packet_out_t *po)
+{
+    if (po && po->po_used_size > 0) {
+        return (float)po->po_used_size;
+    }
+    return (float)XQC_ML_CC_MSS;
+}
+
+static void
+xqc_ml_cc_clamp_cwnd(xqc_ml_cc_t *ml_cc)
+{
+    if (ml_cc->cwnd_bytes < ml_cc->min_cwnd_bytes) {
+        ml_cc->cwnd_bytes = ml_cc->min_cwnd_bytes;
+    }
+    if (ml_cc->cwnd_bytes > XQC_ML_CC_MAX_CWND) {
+        ml_cc->cwnd_bytes = XQC_ML_CC_MAX_CWND;
+    }
+}
+
+static xqc_ml_cc_state_t
+xqc_ml_cc_determine_state(xqc_ml_cc_t *ml_cc)
+{
+    float max_prob;
+    int max_idx;
+    int i;
+
+    if (ml_cc->state_probs[3] > XQC_ML_CC_NH_THRESHOLD) {
+        return XQC_ML_CC_STATE_NH;
+    }
+
+    max_prob = ml_cc->state_probs[0];
+    max_idx = 0;
+    for (i = 1; i < 4; i++) {
+        if (ml_cc->state_probs[i] > max_prob) {
+            max_prob = ml_cc->state_probs[i];
+            max_idx = i;
+        }
+    }
+
+    return (xqc_ml_cc_state_t)max_idx;
+}
+
+#ifdef XQC_ENABLE_ONNX
+static OrtSession *
+xqc_ml_cc_create_session(const OrtApi *api, const char *model_path)
+{
+    OrtEnv *env = NULL;
+    OrtSessionOptions *options = NULL;
+    OrtSession *session = NULL;
+    OrtStatus *status = NULL;
+
+    if (api == NULL || model_path == NULL) {
+        return NULL;
+    }
+
+    status = api->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "xqc_ml_cc", &env);
+    if (status != NULL) {
+        goto end;
+    }
+
+    status = api->CreateSessionOptions(&options);
+    if (status != NULL) {
+        goto end;
+    }
+
+    status = api->CreateSession(env, model_path, options, &session);
+
+end:
+    if (status != NULL) {
+        api->ReleaseStatus(status);
+        session = NULL;
+    }
+    if (options != NULL) {
+        api->ReleaseSessionOptions(options);
+    }
+    if (env != NULL) {
+        api->ReleaseEnv(env);
+    }
+    return session;
+}
+
+static xqc_bool_t
+xqc_ml_cc_run_ort_inference(xqc_ml_cc_t *ml_cc, void *session_ptr,
+    const char *output_name, const float *mean, const float *scale,
+    float *output, size_t output_len)
+{
+    const OrtApi *api;
+    OrtSession *session;
+    OrtMemoryInfo *mem_info = NULL;
+    OrtValue *input_tensor = NULL;
+    OrtValue *output_tensor = NULL;
+    OrtStatus *status = NULL;
+    const char *input_names[] = {"input"};
+    const char *output_names[1];
+    const OrtValue *input_values[1];
+    float input[1][XQC_ML_CC_WINDOW_SIZE][XQC_ML_CC_NUM_FEATURES];
+    float *output_data = NULL;
+    int64_t input_shape[] = {1, XQC_ML_CC_WINDOW_SIZE, XQC_ML_CC_NUM_FEATURES};
+    size_t i;
+    xqc_bool_t ret = XQC_FALSE;
+
+    if (ml_cc->sample_count < XQC_ML_CC_WINDOW_SIZE
+        || session_ptr == NULL
+        || ml_cc->onnx_api == NULL
+        || output == NULL
+        || output_name == NULL)
+    {
+        return XQC_FALSE;
+    }
+
+    api = (const OrtApi *)ml_cc->onnx_api;
+    session = (OrtSession *)session_ptr;
+
+    xqc_ml_cc_fill_input_window(ml_cc, input, mean, scale);
+
+    status = api->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &mem_info);
+    if (status != NULL) {
+        goto end;
+    }
+
+    status = api->CreateTensorWithDataAsOrtValue(mem_info, input, sizeof(input),
+        input_shape, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_tensor);
+    if (status != NULL) {
+        goto end;
+    }
+
+    output_names[0] = output_name;
+    input_values[0] = input_tensor;
+    status = api->Run(session, NULL, input_names, input_values, 1,
+        output_names, 1, &output_tensor);
+    if (status != NULL) {
+        goto end;
+    }
+
+    status = api->GetTensorMutableData(output_tensor, (void **)&output_data);
+    if (status != NULL || output_data == NULL) {
+        goto end;
+    }
+
+    for (i = 0; i < output_len; i++) {
+        output[i] = output_data[i];
+        if (!isfinite(output[i])) {
+            goto end;
+        }
+    }
+
+    ret = XQC_TRUE;
+
+end:
+    if (status != NULL) {
+        api->ReleaseStatus(status);
+    }
+    if (output_tensor != NULL) {
+        api->ReleaseValue(output_tensor);
+    }
+    if (input_tensor != NULL) {
+        api->ReleaseValue(input_tensor);
+    }
+    if (mem_info != NULL) {
+        api->ReleaseMemoryInfo(mem_info);
+    }
+    return ret;
+}
+
+static void
+xqc_ml_cc_run_state_inference(xqc_ml_cc_t *ml_cc)
+{
+    float logits[4];
+
+    if (!xqc_ml_cc_run_ort_inference(ml_cc, ml_cc->onnx_session, "output",
+            xqc_ml_cc_scaler_mean, xqc_ml_cc_scaler_scale, logits, 4))
+    {
+        xqc_ml_cc_set_uniform_probs(ml_cc);
+        return;
+    }
+
+    xqc_ml_cc_softmax(logits, ml_cc->state_probs, 4);
+}
+
+static xqc_bool_t
+xqc_ml_cc_run_qu_queue_inference(xqc_ml_cc_t *ml_cc, float *queue_depth)
+{
+    float raw_output = 0.0f;
+
+    if (!xqc_ml_cc_run_ort_inference(ml_cc, ml_cc->queue_onnx_session,
+            "queue_depth_percentage", xqc_ml_cc_qu_scaler_mean,
+            xqc_ml_cc_qu_scaler_scale, &raw_output, 1))
+    {
+        return XQC_FALSE;
+    }
+
+    *queue_depth = xqc_ml_cc_clamp_float(raw_output, 0.0f, 1.0f);
+    return XQC_TRUE;
+}
+#else
+static void
+xqc_ml_cc_run_state_inference(xqc_ml_cc_t *ml_cc)
+{
+    xqc_ml_cc_set_uniform_probs(ml_cc);
+}
+
+static xqc_bool_t
+xqc_ml_cc_run_qu_queue_inference(xqc_ml_cc_t *ml_cc, float *queue_depth)
+{
+    (void)ml_cc;
+    (void)queue_depth;
+    return XQC_FALSE;
+}
+#endif
+
+static void
+xqc_ml_cc_apply_qu_fallback(xqc_ml_cc_t *ml_cc)
+{
+    ml_cc->qu_consecutive_count++;
+
+    if (ml_cc->qu_consecutive_count >= XQC_ML_CC_QU_CONSECUTIVE_THRESHOLD) {
+        ml_cc->cwnd_bytes *= XQC_ML_CC_QU_CWND_DECREASE;
+        ml_cc->qu_consecutive_count = 0;
+        xqc_ml_cc_clamp_cwnd(ml_cc);
+
+        xqc_log(ml_cc->log, XQC_LOG_DEBUG,
+                "|ml_cc|qu_fallback|cwnd:%u|threshold:%d|",
+                (uint32_t)ml_cc->cwnd_bytes,
+                XQC_ML_CC_QU_CONSECUTIVE_THRESHOLD);
+    }
+}
+
+static float
+xqc_ml_cc_calc_qu_growth_strength(xqc_ml_cc_t *ml_cc)
+{
+    float low_boundary = ml_cc->queue_threshold_k - XQC_ML_CC_QU_QUEUE_DEADZONE;
+    float dist_up;
+
+    if (ml_cc->queue_depth_ema >= low_boundary) {
+        return 0.0f;
+    }
+
+    low_boundary = xqc_max(low_boundary, XQC_ML_CC_EPSILON);
+    dist_up = (low_boundary - ml_cc->queue_depth_ema) / low_boundary;
+    dist_up = xqc_ml_cc_clamp_float(dist_up, 0.0f, 1.0f);
+
+    return powf(dist_up, XQC_ML_CC_QU_GAMMA_UP);
+}
+
+static float
+xqc_ml_cc_calc_qu_drain_strength(xqc_ml_cc_t *ml_cc)
+{
+    float high_boundary = ml_cc->queue_threshold_k + XQC_ML_CC_QU_QUEUE_DEADZONE;
+    float denom;
+    float dist_down;
+
+    if (ml_cc->queue_depth_ema <= high_boundary) {
+        return 0.0f;
+    }
+
+    denom = xqc_max(1.0f - high_boundary, XQC_ML_CC_EPSILON);
+    dist_down = (ml_cc->queue_depth_ema - high_boundary) / denom;
+    dist_down = xqc_ml_cc_clamp_float(dist_down, 0.0f, 1.0f);
+
+    return powf(dist_down, XQC_ML_CC_QU_GAMMA_DOWN);
+}
+
+static void
+xqc_ml_cc_apply_qu_fine_grained_control(xqc_ml_cc_t *ml_cc, xqc_packet_out_t *po)
+{
+    float acked = xqc_ml_cc_get_acked_bytes(po);
+    float grow_strength = 0.0f;
+    float drain_strength = 0.0f;
+    float cwnd_before = ml_cc->cwnd_bytes;
+    const char *mode = "hold";
+
+    ml_cc->qu_consecutive_count = 0;
+
+    if (ml_cc->queue_depth_ema < ml_cc->queue_threshold_k - XQC_ML_CC_QU_QUEUE_DEADZONE) {
+        grow_strength = xqc_ml_cc_calc_qu_growth_strength(ml_cc);
+        ml_cc->cwnd_bytes += acked * XQC_ML_CC_QU_GROWTH_BASE * grow_strength;
+        mode = "grow";
+
+    } else if (ml_cc->queue_depth_ema > ml_cc->queue_threshold_k + XQC_ML_CC_QU_QUEUE_DEADZONE) {
+        drain_strength = xqc_ml_cc_calc_qu_drain_strength(ml_cc);
+        ml_cc->cwnd_bytes -= acked * XQC_ML_CC_QU_DRAIN_BASE * drain_strength;
+        mode = "drain";
+
+    } else {
+        ml_cc->cwnd_bytes += acked * XQC_ML_CC_QU_HOLD_GAIN;
+    }
+
+    xqc_ml_cc_clamp_cwnd(ml_cc);
+
+    xqc_log(ml_cc->log, XQC_LOG_DEBUG,
+            "|ml_cc|qu_fine|mode:%s|prob_qu:%.3f|queue_raw:%.3f|queue_ema:%.3f|"
+            "queue_k:%.3f|grow:%.3f|drain:%.3f|acked:%.1f|cwnd_before:%u|cwnd_after:%u|",
+            mode, ml_cc->state_probs[XQC_ML_CC_STATE_QU], ml_cc->queue_depth_raw,
+            ml_cc->queue_depth_ema, ml_cc->queue_threshold_k, grow_strength,
+            drain_strength, acked, (uint32_t)cwnd_before, (uint32_t)ml_cc->cwnd_bytes);
+}
+
+void
+xqc_ml_cc_feed_features(void *cong, xqc_usec_t ack_recv_time,
+    xqc_usec_t adjusted_rtt, double short_loss_rate, unsigned short_lost_cnt,
+    unsigned short_send_cnt, double long_loss_rate, unsigned long_lost_cnt,
+    unsigned long_send_cnt, xqc_usec_t response_interval, uint64_t cwnd,
+    unsigned pkt_in_fly)
+{
+    xqc_ml_cc_t *ml_cc = (xqc_ml_cc_t *)cong;
+    float features[XQC_ML_CC_NUM_FEATURES];
+
+    (void)ack_recv_time;
+
+    if (ml_cc == NULL) {
+        return;
+    }
+
+    memset(features, 0, sizeof(features));
+    xqc_ml_cc_build_features(ml_cc, features, adjusted_rtt, short_loss_rate,
+        short_lost_cnt, short_send_cnt, long_loss_rate, long_lost_cnt,
+        long_send_cnt, response_interval, cwnd, pkt_in_fly);
 
     xqc_ml_cc_update_window(ml_cc, features);
 
     if (!ml_cc->is_frozen) {
-        xqc_ml_cc_run_inference(ml_cc);
+        xqc_ml_cc_run_state_inference(ml_cc);
         ml_cc->last_state = xqc_ml_cc_determine_state(ml_cc);
     }
 
@@ -340,15 +529,18 @@ static void
 xqc_ml_cc_init(void *cong, xqc_send_ctl_t *ctl_ctx, xqc_cc_params_t cc_params)
 {
     xqc_ml_cc_t *ml_cc = (xqc_ml_cc_t *)cong;
+
     ml_cc->send_ctl = ctl_ctx;
     ml_cc->log = ctl_ctx->ctl_conn->log;
-
     ml_cc->init_cwnd_bytes = XQC_ML_CC_INIT_WIN;
     ml_cc->min_cwnd_bytes = XQC_ML_CC_MIN_CWND;
 
     if (cc_params.customize_on) {
         if (cc_params.init_cwnd > 0) {
             ml_cc->init_cwnd_bytes = cc_params.init_cwnd * XQC_ML_CC_MSS;
+        }
+        if (cc_params.min_cwnd > 0) {
+            ml_cc->min_cwnd_bytes = cc_params.min_cwnd * XQC_ML_CC_MSS;
         }
     }
 
@@ -357,18 +549,20 @@ xqc_ml_cc_init(void *cong, xqc_send_ctl_t *ctl_ctx, xqc_cc_params_t cc_params)
     ml_cc->sample_count = 0;
     ml_cc->last_prediction = 50.0f;
     ml_cc->use_ml_prediction = 1;
-
     ml_cc->congestion_recovery_start_time = 0;
     ml_cc->last_rtt = 0;
     ml_cc->loss_reduction_factor = 0.0f;
-
     ml_cc->last_state = XQC_ML_CC_STATE_NONE;
     ml_cc->qu_consecutive_count = 0;
     ml_cc->is_frozen = XQC_FALSE;
     ml_cc->freeze_start_time = 0;
-    ml_cc->last_state = XQC_ML_CC_STATE_NONE;
     ml_cc->frozen_cwnd = ml_cc->cwnd_bytes;
     ml_cc->loss_spike_during_freeze = XQC_FALSE;
+    ml_cc->queue_depth_raw = 0.0f;
+    ml_cc->queue_depth_ema = 0.0f;
+    ml_cc->queue_threshold_k = XQC_ML_CC_QU_QUEUE_K;
+    ml_cc->queue_model_enabled = 1;
+    ml_cc->queue_model_ready = 0;
 
     memset(ml_cc->history_window, 0, sizeof(ml_cc->history_window));
     memset(ml_cc->state_probs, 0, sizeof(ml_cc->state_probs));
@@ -376,37 +570,30 @@ xqc_ml_cc_init(void *cong, xqc_send_ctl_t *ctl_ctx, xqc_cc_params_t cc_params)
 #ifdef XQC_ENABLE_ONNX
     ml_cc->onnx_api = (void *)OrtGetApiBase()->GetApi(ORT_API_VERSION);
     ml_cc->onnx_session = NULL;
+    ml_cc->queue_onnx_session = NULL;
 
-    if (ml_cc->onnx_api) {
+    if (ml_cc->onnx_api != NULL) {
         const OrtApi *api = (const OrtApi *)ml_cc->onnx_api;
-        OrtEnv *env = NULL;
-        OrtStatus *status = api->CreateEnv(
-            ORT_LOGGING_LEVEL_WARNING, "xqc_ml_cc", &env);
-
-        if (status == NULL && env) {
-            OrtSession *session = NULL;
-            status = api->CreateSession(
-                env,
-                XQC_ONNX_MODEL_PATH,
-                NULL,
-                &session);
-
-            if (status == NULL && session != NULL) {
-                ml_cc->onnx_session = (void *)session;
-            }
-            api->ReleaseEnv(env);
-        }
+        ml_cc->onnx_session = (void *)xqc_ml_cc_create_session(api, XQC_ONNX_MODEL_PATH);
+#ifdef XQC_ONNX_QUEUE_MODEL_PATH
+        ml_cc->queue_onnx_session = (void *)xqc_ml_cc_create_session(api, XQC_ONNX_QUEUE_MODEL_PATH);
+#endif
     }
+
+    ml_cc->queue_model_ready = ml_cc->queue_onnx_session != NULL ? 1 : 0;
 #else
-    ml_cc->onnx_session = NULL;
     ml_cc->onnx_api = NULL;
+    ml_cc->onnx_session = NULL;
+    ml_cc->queue_onnx_session = NULL;
+    ml_cc->queue_model_ready = 0;
 #endif
 
     xqc_log(ml_cc->log, XQC_LOG_DEBUG,
-            "|ml_cc|initialized|cwnd:%u|onnx:%d|qu_threshold:%d|",
+            "|ml_cc|initialized|cwnd:%u|state_onnx:%d|queue_onnx:%d|queue_k:%.2f|",
             (uint32_t)ml_cc->cwnd_bytes,
             ml_cc->onnx_session != NULL ? 1 : 0,
-            XQC_ML_CC_QU_CONSECUTIVE_THRESHOLD);
+            ml_cc->queue_onnx_session != NULL ? 1 : 0,
+            ml_cc->queue_threshold_k);
 }
 
 static void
@@ -417,10 +604,11 @@ xqc_ml_cc_on_ack(void *cong, xqc_packet_out_t *po, xqc_usec_t now)
     if (ml_cc->is_frozen) {
         xqc_usec_t elapsed = now - ml_cc->freeze_start_time;
         double short_loss_rate = 0.0;
-
         xqc_send_ctl_t *ctl = ml_cc->send_ctl;
+
         if (ctl && ctl->ctl_recent_send_count[0] > 0) {
-            short_loss_rate = (double)ctl->ctl_recent_lost_count[0] / ctl->ctl_recent_send_count[0] * 100.0;
+            short_loss_rate = (double)ctl->ctl_recent_lost_count[0]
+                / ctl->ctl_recent_send_count[0] * 100.0;
         }
 
         if (elapsed < XQC_ML_CC_NH_FREEZE_DURATION) {
@@ -453,9 +641,7 @@ xqc_ml_cc_on_ack(void *cong, xqc_packet_out_t *po, xqc_usec_t now)
         }
     }
 
-    xqc_ml_cc_state_t state = ml_cc->last_state;
-
-    if (state == XQC_ML_CC_STATE_NH) {
+    if (ml_cc->last_state == XQC_ML_CC_STATE_NH) {
         ml_cc->frozen_cwnd = ml_cc->cwnd_bytes * XQC_ML_CC_NH_FREEZE_CWND_FACTOR;
         ml_cc->cwnd_bytes = ml_cc->frozen_cwnd;
         ml_cc->is_frozen = XQC_TRUE;
@@ -468,53 +654,56 @@ xqc_ml_cc_on_ack(void *cong, xqc_packet_out_t *po, xqc_usec_t now)
         return;
     }
 
-    if (state == XQC_ML_CC_STATE_UT) {
+    if (ml_cc->last_state == XQC_ML_CC_STATE_UT) {
+        float acked = xqc_ml_cc_get_acked_bytes(po);
         ml_cc->qu_consecutive_count = 0;
-        float ack_bytes = 0.0f;
-        if (po) {
-            ack_bytes = (float)po->po_used_size;
-        }
-        ml_cc->cwnd_bytes += ack_bytes * XQC_ML_CC_UT_CWND_GAIN;
+        ml_cc->cwnd_bytes += acked * XQC_ML_CC_UT_CWND_GAIN;
+        xqc_ml_cc_clamp_cwnd(ml_cc);
 
         xqc_log(ml_cc->log, XQC_LOG_DEBUG,
-                "|ml_cc|ut_state|gain:%.2f|cwnd:%u|",
-                XQC_ML_CC_UT_CWND_GAIN, (uint32_t)ml_cc->cwnd_bytes);
+                "|ml_cc|ut_state|gain:%.2f|acked:%.1f|cwnd:%u|",
+                XQC_ML_CC_UT_CWND_GAIN, acked, (uint32_t)ml_cc->cwnd_bytes);
+        return;
+    }
 
-    } else if (state == XQC_ML_CC_STATE_QU) {
-        ml_cc->qu_consecutive_count++;
+    if (ml_cc->last_state == XQC_ML_CC_STATE_QU) {
+        float queue_depth = 0.0f;
 
-        if (ml_cc->qu_consecutive_count >= XQC_ML_CC_QU_CONSECUTIVE_THRESHOLD) {
-            ml_cc->cwnd_bytes *= XQC_ML_CC_QU_CWND_DECREASE;
-            if (ml_cc->cwnd_bytes < ml_cc->min_cwnd_bytes) {
-                ml_cc->cwnd_bytes = ml_cc->min_cwnd_bytes;
-            }
-            ml_cc->qu_consecutive_count = 0;
-
-            xqc_log(ml_cc->log, XQC_LOG_DEBUG,
-                    "|ml_cc|qu_state|decrease|cwnd:%u|qu_count:%d|",
-                    (uint32_t)ml_cc->cwnd_bytes, ml_cc->qu_consecutive_count);
+        if (ml_cc->queue_model_enabled
+            && ml_cc->queue_model_ready
+            && ml_cc->state_probs[XQC_ML_CC_STATE_QU] >= XQC_ML_CC_QU_CONFIDENCE_THRESHOLD
+            && xqc_ml_cc_run_qu_queue_inference(ml_cc, &queue_depth))
+        {
+            ml_cc->queue_depth_raw = queue_depth;
+            ml_cc->queue_depth_ema = xqc_ml_cc_clamp_float(
+                (1.0f - XQC_ML_CC_QU_QUEUE_EMA_ALPHA) * ml_cc->queue_depth_ema
+                + XQC_ML_CC_QU_QUEUE_EMA_ALPHA * queue_depth,
+                0.0f, 1.0f);
+            xqc_ml_cc_apply_qu_fine_grained_control(ml_cc, po);
+        } else {
+            xqc_ml_cc_apply_qu_fallback(ml_cc);
         }
 
-    } else if (state == XQC_ML_CC_STATE_EB) {
+        return;
+    }
+
+    if (ml_cc->last_state == XQC_ML_CC_STATE_EB) {
         ml_cc->qu_consecutive_count = 0;
         ml_cc->cwnd_bytes *= XQC_ML_CC_EB_CWND_DECREASE;
-        if (ml_cc->cwnd_bytes < ml_cc->min_cwnd_bytes) {
-            ml_cc->cwnd_bytes = ml_cc->min_cwnd_bytes;
-        }
+        xqc_ml_cc_clamp_cwnd(ml_cc);
 
         xqc_log(ml_cc->log, XQC_LOG_DEBUG,
                 "|ml_cc|eb_state|decrease|cwnd:%u|",
                 (uint32_t)ml_cc->cwnd_bytes);
-    }
-
-    if (ml_cc->cwnd_bytes > XQC_ML_CC_MAX_CWND) {
-        ml_cc->cwnd_bytes = XQC_ML_CC_MAX_CWND;
+        return;
     }
 }
 
 static void
 xqc_ml_cc_on_lost(void *cong, xqc_usec_t lost_sent_time)
 {
+    (void)cong;
+    (void)lost_sent_time;
 }
 
 static uint64_t
@@ -541,6 +730,7 @@ xqc_ml_cc_in_slow_start(void *cong)
 static int
 xqc_ml_cc_in_recovery(void *cong)
 {
+    (void)cong;
     return 0;
 }
 
@@ -548,18 +738,19 @@ static void
 xqc_ml_cc_restart_from_idle(void *cong, uint64_t arg)
 {
     xqc_ml_cc_t *ml_cc = (xqc_ml_cc_t *)cong;
+    (void)arg;
     ml_cc->cwnd_bytes = xqc_max(ml_cc->cwnd_bytes, ml_cc->init_cwnd_bytes);
 }
 
 const xqc_cong_ctrl_callback_t xqc_ml_cc_cb = {
-    .xqc_cong_ctl_size            = xqc_ml_cc_size,
-    .xqc_cong_ctl_init            = xqc_ml_cc_init,
-    .xqc_cong_ctl_on_lost         = xqc_ml_cc_on_lost,
-    .xqc_cong_ctl_on_ack          = xqc_ml_cc_on_ack,
-    .xqc_cong_ctl_get_cwnd        = xqc_ml_cc_get_cwnd,
-    .xqc_cong_ctl_reset_cwnd      = xqc_ml_cc_reset_cwnd,
-    .xqc_cong_ctl_in_slow_start   = xqc_ml_cc_in_slow_start,
-    .xqc_cong_ctl_in_recovery     = xqc_ml_cc_in_recovery,
+    .xqc_cong_ctl_size              = xqc_ml_cc_size,
+    .xqc_cong_ctl_init              = xqc_ml_cc_init,
+    .xqc_cong_ctl_on_lost           = xqc_ml_cc_on_lost,
+    .xqc_cong_ctl_on_ack            = xqc_ml_cc_on_ack,
+    .xqc_cong_ctl_get_cwnd          = xqc_ml_cc_get_cwnd,
+    .xqc_cong_ctl_reset_cwnd        = xqc_ml_cc_reset_cwnd,
+    .xqc_cong_ctl_in_slow_start     = xqc_ml_cc_in_slow_start,
+    .xqc_cong_ctl_in_recovery       = xqc_ml_cc_in_recovery,
     .xqc_cong_ctl_restart_from_idle = xqc_ml_cc_restart_from_idle,
-    .xqc_cong_ctl_info_cb         = NULL,
+    .xqc_cong_ctl_info_cb           = NULL,
 };

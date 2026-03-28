@@ -395,10 +395,13 @@ if(XQC_ENABLE_ML_CC)
     endif()
 
     set(ONNX_MODEL_PATH "${ONNX_MODEL_DIR}/state_prediction_no_validation.onnx")
+    set(ONNX_QUEUE_MODEL_PATH
+        "${ONNX_MODEL_DIR}/qu_queue_depth/qu_queue_depth_regressor.onnx")
 
     add_definitions(-DXQC_ENABLE_ONNX)
     add_definitions(-DXQC_ONNX_MODEL_DIR="${ONNX_MODEL_DIR}")
     add_definitions(-DXQC_ONNX_MODEL_PATH="${ONNX_MODEL_PATH}")
+    add_definitions(-DXQC_ONNX_QUEUE_MODEL_PATH="${ONNX_QUEUE_MODEL_PATH}")
 
     find_path(ONNXRUNTIME_INCLUDE onnxruntime_c_api.h
         PATHS ${ONNX_RUNTIME_DIR}/include
@@ -474,4 +477,3 @@ if(CMAKE_BUILD_TYPE STREQUAL MinSizeRel)
     add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
             COMMAND ${CMAKE_STRIP} libxquic.so)
 endif()
-

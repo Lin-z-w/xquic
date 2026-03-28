@@ -28,6 +28,16 @@
 #define XQC_ML_CC_QU_CWND_DECREASE        0.95f
 #define XQC_ML_CC_EB_CWND_DECREASE        0.5f
 
+#define XQC_ML_CC_QU_QUEUE_K              0.40f
+#define XQC_ML_CC_QU_QUEUE_DEADZONE       0.05f
+#define XQC_ML_CC_QU_QUEUE_EMA_ALPHA      0.25f
+#define XQC_ML_CC_QU_GROWTH_BASE          1.10f
+#define XQC_ML_CC_QU_DRAIN_BASE           1.30f
+#define XQC_ML_CC_QU_HOLD_GAIN            0.05f
+#define XQC_ML_CC_QU_GAMMA_UP             1.5f
+#define XQC_ML_CC_QU_GAMMA_DOWN           1.2f
+#define XQC_ML_CC_QU_CONFIDENCE_THRESHOLD 0.50f
+
 typedef enum {
     XQC_ML_CC_STATE_UT = 0,
     XQC_ML_CC_STATE_QU = 1,
@@ -50,6 +60,7 @@ typedef struct xqc_ml_cc_s {
 
     void                   *onnx_session;
     void                   *onnx_api;
+    void                   *queue_onnx_session;
 
     int                     use_ml_prediction;
     float                   last_prediction;
@@ -65,11 +76,18 @@ typedef struct xqc_ml_cc_s {
     xqc_usec_t              freeze_start_time;
     float                   frozen_cwnd;
     xqc_bool_t              loss_spike_during_freeze;
+    float                   queue_depth_raw;
+    float                   queue_depth_ema;
+    float                   queue_threshold_k;
+    int                     queue_model_enabled;
+    int                     queue_model_ready;
 
 } xqc_ml_cc_t;
 
 extern const float xqc_ml_cc_scaler_mean[XQC_ML_CC_NUM_FEATURES];
 extern const float xqc_ml_cc_scaler_scale[XQC_ML_CC_NUM_FEATURES];
+extern const float xqc_ml_cc_qu_scaler_mean[XQC_ML_CC_NUM_FEATURES];
+extern const float xqc_ml_cc_qu_scaler_scale[XQC_ML_CC_NUM_FEATURES];
 
 extern const xqc_cong_ctrl_callback_t xqc_ml_cc_cb;
 
