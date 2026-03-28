@@ -19,227 +19,150 @@
 #define XQC_ML_CC_USEC2SEC  1000000.0
 #define XQC_ML_CC_MAX_CWND  (1024 * 1024 * 1024)
 
-typedef struct {
-    float                   adjusted_rtt;
-    float                   short_loss_rate;
-    float                   long_loss_rate;
-    float                   response_interval;
-    float                   cwnd;
-    float                   pkt_in_fly;
-    float                   rtt_delta;
-    float                   cwnd_delta;
-    float                   pkt_in_fly_delta;
-    float                   cwnd_per_rtt;
-    float                   pkt_per_rtt;
-    float                   pkt_per_cwnd;
-    float                   adjusted_rtt_roll_mean;
-    float                   adjusted_rtt_roll_std;
-    float                   cwnd_roll_mean;
-    float                   cwnd_roll_std;
-    float                   pkt_in_fly_roll_mean;
-    float                   pkt_in_fly_roll_std;
-} xqc_ml_features_t;
+const float xqc_ml_cc_scaler_mean[XQC_ML_CC_NUM_FEATURES] = {
+    8.96128915e+04f, 6.79938659e+00f, 1.30212317e+02f, 1.61393684e+03f,
+    6.74786114e+00f, 3.83006478e+02f, 4.73249606e+03f, 3.85382679e+03f,
+    1.62961778e+06f, 6.50594380e+02f, 1.62115443e+00f, 1.00222519e+00f,
+    5.18842275e-04f, 1.89891871e+03f, 5.15254543e-02f
+};
 
-static int
-xqc_ml_cc_load_npy(const char *filename, float *data, int expected_size)
+const float xqc_ml_cc_scaler_scale[XQC_ML_CC_NUM_FEATURES] = {
+    5.86602124e+04f, 1.58179157e+01f, 4.45019329e+02f, 1.69024452e+03f,
+    1.32390146e+01f, 9.93498002e+02f, 3.69058068e+03f, 1.17108226e+04f,
+    1.48773062e+06f, 5.11887834e+02f, 5.66852703e+03f, 7.30771491e-02f,
+    2.20059070e-04f, 2.61691161e+03f, 9.01346935e+00f
+};
+
+static void
+xqc_ml_cc_softmax(float *input, float *output, int length)
 {
-    FILE *fp = fopen(filename, "rb");
-    if (!fp) {
-        return -1;
-    }
-
-    char header[256];
-    if (fgets(header, sizeof(header), fp) == NULL) {
-        fclose(fp);
-        return -1;
-    }
-
-    int dims = 0;
-    int shape[4] = {0};
-    char *p = strstr(header, "(");
-    if (p) {
-        char *q = p + 1;
-        while (*q && *q != ')' && dims < 4) {
-            if (*q >= '0' && *q <= '9') {
-                shape[dims] = shape[dims] * 10 + (*q - '0');
-            } else if (*q == ',') {
-                dims++;
-            }
-            q++;
+    float max_val = input[0];
+    for (int i = 1; i < length; i++) {
+        if (input[i] > max_val) {
+            max_val = input[i];
         }
-        if (*q == ')') dims++;
     }
 
-    int total = 1;
-    for (int i = 0; i < dims; i++) total *= shape[i];
-
-    if (total != expected_size) {
-        fclose(fp);
-        return -1;
+    float sum = 0.0f;
+    for (int i = 0; i < length; i++) {
+        sum += expf(input[i] - max_val);
     }
 
-    fread(data, sizeof(float), total, fp);
-    fclose(fp);
-
-    return 0;
+    for (int i = 0; i < length; i++) {
+        output[i] = expf(input[i] - max_val) / sum;
+    }
 }
 
 static void
-xqc_ml_cc_extract_features(xqc_ml_cc_t *ml_cc, xqc_ml_features_t *features)
+xqc_ml_cc_normalize_features(float *normalized, float *raw, int size)
+{
+    for (int i = 0; i < size; i++) {
+        if (xqc_ml_cc_scaler_scale[i] > 1e-6f) {
+            normalized[i] = (raw[i] - xqc_ml_cc_scaler_mean[i]) / xqc_ml_cc_scaler_scale[i];
+        } else {
+            normalized[i] = raw[i] - xqc_ml_cc_scaler_mean[i];
+        }
+    }
+}
+
+static void
+xqc_ml_cc_extract_features(xqc_ml_cc_t *ml_cc, float *features)
 {
     xqc_send_ctl_t *ctl = ml_cc->send_ctl;
     if (!ctl) {
-        memset(features, 0, sizeof(xqc_ml_features_t));
+        memset(features, 0, XQC_ML_CC_NUM_FEATURES * sizeof(float));
         return;
     }
 
     float adjusted_rtt = (float)ctl->ctl_srtt / 1000.0f;
-    float cwnd_bytes = (float)ml_cc->cwnd_bytes;
+    float cwnd_bytes = ml_cc->cwnd_bytes;
     float pkt_in_fly = (float)ctl->ctl_bytes_in_flight;
-    float cwnd_pkt = cwnd_bytes / XQC_ML_CC_MSS;
-    float pkt_in_fly_pkt = pkt_in_fly / XQC_ML_CC_MSS;
 
-    float short_loss_rate = 0.0f;
-    float long_loss_rate = 0.0f;
-    if (ctl->ctl_send_count > 0) {
-        short_loss_rate = (float)ctl->ctl_recent_lost_count[0] / 
-                          xqc_max(1, ctl->ctl_recent_send_count[0]);
-        long_loss_rate = (float)ctl->ctl_lost_count / 
-                        xqc_max(1, ctl->ctl_send_count);
-    }
+    float short_lost_cnt = (float)ctl->ctl_recent_lost_count[0];
+    float short_send_cnt = (float)ctl->ctl_recent_send_count[0];
+    float short_loss_rate = (short_send_cnt > 0) ? (short_lost_cnt / short_send_cnt * 100.0f) : 0.0f;
+
+    float long_lost_cnt = (float)(ctl->ctl_recent_lost_count[0] + ctl->ctl_recent_lost_count[1]);
+    float long_send_cnt = (float)(ctl->ctl_recent_send_count[0] + ctl->ctl_recent_send_count[1]);
+    float long_loss_rate = (long_send_cnt > 0) ? (long_lost_cnt / long_send_cnt * 100.0f) : 0.0f;
 
     float response_interval = 0.0f;
     if (ctl->ctl_delivered_time > 0 && ctl->ctl_first_sent_time > 0) {
         response_interval = (float)(ctl->ctl_delivered_time - ctl->ctl_first_sent_time) / 1000.0f;
     }
 
-    features->adjusted_rtt = adjusted_rtt;
-    features->short_loss_rate = short_loss_rate;
-    features->long_loss_rate = long_loss_rate;
-    features->response_interval = response_interval;
-    features->cwnd = cwnd_bytes;
-    features->pkt_in_fly = pkt_in_fly;
-
-    float prev_cwnd = 0.0f, prev_pkt_in_fly = 0.0f, prev_rtt = 0.0f;
+    float prev_rtt = 0.0f, prev_cwnd = 0.0f;
     if (ml_cc->sample_count > 0) {
         int prev_idx = (ml_cc->window_idx - 1 + XQC_ML_CC_WINDOW_SIZE) % XQC_ML_CC_WINDOW_SIZE;
-        prev_cwnd = ml_cc->history_window[prev_idx][4];
-        prev_pkt_in_fly = ml_cc->history_window[prev_idx][5];
         prev_rtt = ml_cc->history_window[prev_idx][0];
-    }
-    features->rtt_delta = adjusted_rtt - prev_rtt;
-    features->cwnd_delta = cwnd_bytes - prev_cwnd;
-    features->pkt_in_fly_delta = pkt_in_fly - prev_pkt_in_fly;
-
-    features->cwnd_per_rtt = (adjusted_rtt > 0) ? (cwnd_bytes / adjusted_rtt) : 0.0f;
-    features->pkt_per_rtt = (adjusted_rtt > 0) ? (pkt_in_fly_pkt / adjusted_rtt) : 0.0f;
-    features->pkt_per_cwnd = (cwnd_pkt > 0) ? (pkt_in_fly_pkt / cwnd_pkt) : 0.0f;
-
-    float rtt_sum = 0.0f, rtt_sq_sum = 0.0f;
-    float cwnd_sum = 0.0f, cwnd_sq_sum = 0.0f;
-    float pkt_sum = 0.0f, pkt_sq_sum = 0.0f;
-    int count = xqc_min(ml_cc->sample_count, XQC_ML_CC_WINDOW_SIZE);
-
-    for (int i = 0; i < count; i++) {
-        int idx = (ml_cc->window_idx - i - 1 + XQC_ML_CC_WINDOW_SIZE) % XQC_ML_CC_WINDOW_SIZE;
-        rtt_sum += ml_cc->history_window[idx][0];
-        rtt_sq_sum += ml_cc->history_window[idx][0] * ml_cc->history_window[idx][0];
-        cwnd_sum += ml_cc->history_window[idx][4];
-        cwnd_sq_sum += ml_cc->history_window[idx][4] * ml_cc->history_window[idx][4];
-        pkt_sum += ml_cc->history_window[idx][5];
-        pkt_sq_sum += ml_cc->history_window[idx][5] * ml_cc->history_window[idx][5];
+        prev_cwnd = ml_cc->history_window[prev_idx][8];
     }
 
-    float rtt_mean = (count > 0) ? (rtt_sum / count) : 0.0f;
-    float cwnd_mean = (count > 0) ? (cwnd_sum / count) : 0.0f;
-    float pkt_mean = (count > 0) ? (pkt_sum / count) : 0.0f;
+    float rtt_diff = adjusted_rtt - prev_rtt;
 
-    float rtt_var = (count > 1) ? ((rtt_sq_sum - rtt_sum * rtt_sum / count) / count) : 0.0f;
-    float cwnd_var = (count > 1) ? ((cwnd_sq_sum - cwnd_sum * cwnd_sum / count) / count) : 0.0f;
-    float pkt_var = (count > 1) ? ((pkt_sq_sum - pkt_sum * pkt_sum / count) / count) : 0.0f;
+    float eps = 1e-8f;
+    float cwnd_change = cwnd_bytes / (prev_cwnd + eps);
+    if (cwnd_change < 0.1f) cwnd_change = 0.1f;
+    if (cwnd_change > 10.0f) cwnd_change = 10.0f;
 
-    features->adjusted_rtt_roll_mean = rtt_mean;
-    features->adjusted_rtt_roll_std = sqrtf(xqc_max(0.0f, rtt_var));
-    features->cwnd_roll_mean = cwnd_mean;
-    features->cwnd_roll_std = sqrtf(xqc_max(0.0f, cwnd_var));
-    features->pkt_in_fly_roll_mean = pkt_mean;
-    features->pkt_in_fly_roll_std = sqrtf(xqc_max(0.0f, pkt_var));
+    float pkt_ratio = pkt_in_fly / (cwnd_bytes + eps);
+    if (pkt_ratio < 0.0f) pkt_ratio = 0.0f;
+    if (pkt_ratio > 2.0f) pkt_ratio = 2.0f;
+
+    float throughput_est = short_send_cnt / (response_interval / 1000.0f + eps);
+    if (throughput_est < 0.0f) throughput_est = 0.0f;
+    if (throughput_est > 10000.0f) throughput_est = 10000.0f;
+
+    float loss_rate_diff = short_loss_rate - long_loss_rate;
+    if (loss_rate_diff < -100.0f) loss_rate_diff = -100.0f;
+    if (loss_rate_diff > 100.0f) loss_rate_diff = 100.0f;
+
+    features[0] = adjusted_rtt;
+    features[1] = short_loss_rate;
+    features[2] = short_lost_cnt;
+    features[3] = short_send_cnt;
+    features[4] = long_loss_rate;
+    features[5] = long_lost_cnt;
+    features[6] = long_send_cnt;
+    features[7] = response_interval;
+    features[8] = cwnd_bytes;
+    features[9] = pkt_in_fly;
+    features[10] = rtt_diff;
+    features[11] = cwnd_change;
+    features[12] = pkt_ratio;
+    features[13] = throughput_est;
+    features[14] = loss_rate_diff;
 }
 
 static void
-xqc_ml_cc_update_window(xqc_ml_cc_t *ml_cc, xqc_ml_features_t *features)
+xqc_ml_cc_update_window(xqc_ml_cc_t *ml_cc, float *features)
 {
     float *row = ml_cc->history_window[ml_cc->window_idx];
-    row[0] = features->adjusted_rtt;
-    row[1] = features->short_loss_rate;
-    row[2] = features->long_loss_rate;
-    row[3] = features->response_interval;
-    row[4] = features->cwnd;
-    row[5] = features->pkt_in_fly;
-    row[6] = features->rtt_delta;
-    row[7] = features->cwnd_delta;
-    row[8] = features->pkt_in_fly_delta;
-    row[9] = features->cwnd_per_rtt;
-    row[10] = features->pkt_per_rtt;
-    row[11] = features->pkt_per_cwnd;
-    row[12] = features->adjusted_rtt_roll_mean;
-    row[13] = features->adjusted_rtt_roll_std;
-    row[14] = features->cwnd_roll_mean;
-    row[15] = features->cwnd_roll_std;
-    row[16] = features->pkt_in_fly_roll_mean;
-    row[17] = features->pkt_in_fly_roll_std;
-
+    for (int i = 0; i < XQC_ML_CC_NUM_FEATURES; i++) {
+        row[i] = features[i];
+    }
     ml_cc->window_idx = (ml_cc->window_idx + 1) % XQC_ML_CC_WINDOW_SIZE;
     ml_cc->sample_count++;
 }
 
-static void
-xqc_ml_cc_normalize_features(float *normalized, float *raw, float *mean, float *scale, int size)
-{
-    for (int i = 0; i < size; i++) {
-        if (scale[i] > 1e-6f) {
-            normalized[i] = (raw[i] - mean[i]) / scale[i];
-        } else {
-            normalized[i] = raw[i] - mean[i];
-        }
-    }
-}
-
 #ifdef XQC_ENABLE_ONNX
-static float
+static void
 xqc_ml_cc_run_inference(xqc_ml_cc_t *ml_cc)
 {
     if (!ml_cc->onnx_session || !ml_cc->onnx_api) {
-        return 50.0f;
+        ml_cc->state_probs[0] = 0.25f;
+        ml_cc->state_probs[1] = 0.25f;
+        ml_cc->state_probs[2] = 0.25f;
+        ml_cc->state_probs[3] = 0.25f;
+        return;
     }
 
-    xqc_ml_features_t features;
-    xqc_ml_cc_extract_features(ml_cc, &features);
-
-    float raw_features[XQC_ML_CC_NUM_FEATURES];
-    raw_features[0] = features.adjusted_rtt;
-    raw_features[1] = features.short_loss_rate;
-    raw_features[2] = features.long_loss_rate;
-    raw_features[3] = features.response_interval;
-    raw_features[4] = features.cwnd;
-    raw_features[5] = features.pkt_in_fly;
-    raw_features[6] = features.rtt_delta;
-    raw_features[7] = features.cwnd_delta;
-    raw_features[8] = features.pkt_in_fly_delta;
-    raw_features[9] = features.cwnd_per_rtt;
-    raw_features[10] = features.pkt_per_rtt;
-    raw_features[11] = features.pkt_per_cwnd;
-    raw_features[12] = features.adjusted_rtt_roll_mean;
-    raw_features[13] = features.adjusted_rtt_roll_std;
-    raw_features[14] = features.cwnd_roll_mean;
-    raw_features[15] = features.cwnd_roll_std;
-    raw_features[16] = features.pkt_in_fly_roll_mean;
-    raw_features[17] = features.pkt_in_fly_roll_std;
-
-    xqc_ml_cc_update_window(ml_cc, &features);
-
     if (ml_cc->sample_count < XQC_ML_CC_WINDOW_SIZE) {
-        return 50.0f;
+        ml_cc->state_probs[0] = 0.25f;
+        ml_cc->state_probs[1] = 0.25f;
+        ml_cc->state_probs[2] = 0.25f;
+        ml_cc->state_probs[3] = 0.25f;
+        return;
     }
 
     float input[1][XQC_ML_CC_WINDOW_SIZE][XQC_ML_CC_NUM_FEATURES];
@@ -259,7 +182,7 @@ xqc_ml_cc_run_inference(xqc_ml_cc_t *ml_cc)
     OrtStatus *status = api->CreateMemoryInfo("Cpu", OrtArenaAllocator, 0, OrtMemTypeDefault, &mem_info);
     if (status != NULL) {
         api->ReleaseStatus(status);
-        return 50.0f;
+        return;
     }
 
     OrtValue *input_tensor = NULL;
@@ -276,7 +199,7 @@ xqc_ml_cc_run_inference(xqc_ml_cc_t *ml_cc)
 
     if (status != NULL) {
         api->ReleaseStatus(status);
-        return 50.0f;
+        return;
     }
 
     const char *input_names[] = {"input"};
@@ -298,121 +221,113 @@ xqc_ml_cc_run_inference(xqc_ml_cc_t *ml_cc)
 
     if (status != NULL) {
         api->ReleaseStatus(status);
-        return 50.0f;
+        return;
     }
 
     float *output_data = NULL;
     status = api->GetTensorMutableData(output_tensor, (void **)&output_data);
-    float prediction = 50.0f;
     if (status == NULL && output_data != NULL) {
-        prediction = output_data[0];
+        float logits[4] = {output_data[0], output_data[1], output_data[2], output_data[3]};
+        xqc_ml_cc_softmax(logits, ml_cc->state_probs, 4);
+    } else {
+        ml_cc->state_probs[0] = 0.25f;
+        ml_cc->state_probs[1] = 0.25f;
+        ml_cc->state_probs[2] = 0.25f;
+        ml_cc->state_probs[3] = 0.25f;
     }
 
     api->ReleaseValue(output_tensor);
-
-    if (prediction < 0) prediction = 0;
-    if (prediction > 100) prediction = 100;
-
-    return prediction;
 }
 #else
-static float
+static void
 xqc_ml_cc_run_inference(xqc_ml_cc_t *ml_cc)
 {
-    xqc_ml_features_t features;
-    xqc_ml_cc_extract_features(ml_cc, &features);
-    xqc_ml_cc_update_window(ml_cc, &features);
-
-    float base_prediction = 50.0f;
-    float queue_factor = features.pkt_in_fly / xqc_max(1, features.cwnd);
-    float loss_factor = 1.0f + features.short_loss_rate + features.long_loss_rate;
-    float rtt_factor = features.adjusted_rtt / 100.0f;
-
-    float prediction = base_prediction * queue_factor * loss_factor * rtt_factor;
-    prediction = xqc_max(0.0f, xqc_min(100.0f, prediction));
-
-    return prediction;
+    ml_cc->state_probs[0] = 0.25f;
+    ml_cc->state_probs[1] = 0.25f;
+    ml_cc->state_probs[2] = 0.25f;
+    ml_cc->state_probs[3] = 0.25f;
 }
 #endif
 
+static xqc_ml_cc_state_t
+xqc_ml_cc_determine_state(xqc_ml_cc_t *ml_cc)
+{
+    if (ml_cc->state_probs[3] > XQC_ML_CC_NH_THRESHOLD) {
+        return XQC_ML_CC_STATE_NH;
+    }
+
+    float max_prob = ml_cc->state_probs[0];
+    int max_idx = 0;
+    for (int i = 1; i < 4; i++) {
+        if (ml_cc->state_probs[i] > max_prob) {
+            max_prob = ml_cc->state_probs[i];
+            max_idx = i;
+        }
+    }
+
+    return (xqc_ml_cc_state_t)max_idx;
+}
+
 void
 xqc_ml_cc_feed_features(void *cong, xqc_usec_t ack_recv_time,
-    xqc_usec_t adjusted_rtt, double short_loss_rate, double long_loss_rate,
-    xqc_usec_t response_interval, uint64_t cwnd, unsigned pkt_in_fly)
+    xqc_usec_t adjusted_rtt, double short_loss_rate, unsigned short_lost_cnt,
+    unsigned short_send_cnt, double long_loss_rate, unsigned long_lost_cnt,
+    unsigned long_send_cnt, xqc_usec_t response_interval, uint64_t cwnd,
+    unsigned pkt_in_fly)
 {
     xqc_ml_cc_t *ml_cc = (xqc_ml_cc_t *)cong;
     if (!ml_cc) {
         return;
     }
 
-    xqc_ml_features_t features;
-    memset(&features, 0, sizeof(features));
+    float features[XQC_ML_CC_NUM_FEATURES];
+    memset(features, 0, sizeof(features));
 
-    features.adjusted_rtt = (float)adjusted_rtt / 1000.0f;
-    features.short_loss_rate = (float)short_loss_rate;
-    features.long_loss_rate = (float)long_loss_rate;
-    features.response_interval = (float)response_interval / 1000.0f;
-    features.cwnd = (float)cwnd;
-    features.pkt_in_fly = (float)pkt_in_fly;
+    features[0] = (float)adjusted_rtt / 1000.0f;
+    features[1] = (float)short_loss_rate;
+    features[2] = (float)short_lost_cnt;
+    features[3] = (float)short_send_cnt;
+    features[4] = (float)long_loss_rate;
+    features[5] = (float)long_lost_cnt;
+    features[6] = (float)long_send_cnt;
+    features[7] = (float)response_interval / 1000.0f;
+    features[8] = (float)cwnd;
+    features[9] = (float)pkt_in_fly;
 
-    float prev_cwnd = 0.0f, prev_pkt_in_fly = 0.0f, prev_rtt = 0.0f;
+    float prev_rtt = 0.0f, prev_cwnd = 0.0f;
     if (ml_cc->sample_count > 0) {
         int prev_idx = (ml_cc->window_idx - 1 + XQC_ML_CC_WINDOW_SIZE) % XQC_ML_CC_WINDOW_SIZE;
-        prev_cwnd = ml_cc->history_window[prev_idx][4];
-        prev_pkt_in_fly = ml_cc->history_window[prev_idx][5];
         prev_rtt = ml_cc->history_window[prev_idx][0];
-    }
-    features.rtt_delta = features.adjusted_rtt - prev_rtt;
-    features.cwnd_delta = features.cwnd - prev_cwnd;
-    features.pkt_in_fly_delta = features.pkt_in_fly - prev_pkt_in_fly;
-
-    float cwnd_pkt = features.cwnd / XQC_ML_CC_MSS;
-    float pkt_in_fly_pkt = features.pkt_in_fly / XQC_ML_CC_MSS;
-    features.cwnd_per_rtt = (features.adjusted_rtt > 0) ? (features.cwnd / features.adjusted_rtt) : 0.0f;
-    features.pkt_per_rtt = (features.adjusted_rtt > 0) ? (pkt_in_fly_pkt / features.adjusted_rtt) : 0.0f;
-    features.pkt_per_cwnd = (cwnd_pkt > 0) ? (pkt_in_fly_pkt / cwnd_pkt) : 0.0f;
-
-    int count = xqc_min(ml_cc->sample_count, XQC_ML_CC_WINDOW_SIZE);
-    float rtt_sum = 0.0f, rtt_sq_sum = 0.0f;
-    float ccwnd_sum = 0.0f, ccwnd_sq_sum = 0.0f;
-    float pkt_sum = 0.0f, pkt_sq_sum = 0.0f;
-
-    for (int i = 0; i < count; i++) {
-        int idx = (ml_cc->window_idx - i - 1 + XQC_ML_CC_WINDOW_SIZE) % XQC_ML_CC_WINDOW_SIZE;
-        rtt_sum += ml_cc->history_window[idx][0];
-        rtt_sq_sum += ml_cc->history_window[idx][0] * ml_cc->history_window[idx][0];
-        ccwnd_sum += ml_cc->history_window[idx][4];
-        ccwnd_sq_sum += ml_cc->history_window[idx][4] * ml_cc->history_window[idx][4];
-        pkt_sum += ml_cc->history_window[idx][5];
-        pkt_sq_sum += ml_cc->history_window[idx][5] * ml_cc->history_window[idx][5];
+        prev_cwnd = ml_cc->history_window[prev_idx][8];
     }
 
-    float rtt_mean = (count > 0) ? (rtt_sum / count) : 0.0f;
-    float ccwnd_mean = (count > 0) ? (ccwnd_sum / count) : 0.0f;
-    float pkt_mean = (count > 0) ? (pkt_sum / count) : 0.0f;
+    features[10] = features[0] - prev_rtt;
 
-    float rtt_var = (count > 1) ? ((rtt_sq_sum - rtt_sum * rtt_sum / count) / count) : 0.0f;
-    float ccwnd_var = (count > 1) ? ((ccwnd_sq_sum - ccwnd_sum * ccwnd_sum / count) / count) : 0.0f;
-    float pkt_var = (count > 1) ? ((pkt_sq_sum - pkt_sum * pkt_sum / count) / count) : 0.0f;
+    float eps = 1e-8f;
+    features[11] = features[8] / (prev_cwnd + eps);
+    if (features[11] < 0.1f) features[11] = 0.1f;
+    if (features[11] > 10.0f) features[11] = 10.0f;
 
-    features.adjusted_rtt_roll_mean = rtt_mean;
-    features.adjusted_rtt_roll_std = sqrtf(xqc_max(0.0f, rtt_var));
-    features.cwnd_roll_mean = ccwnd_mean;
-    features.cwnd_roll_std = sqrtf(xqc_max(0.0f, ccwnd_var));
-    features.pkt_in_fly_roll_mean = pkt_mean;
-    features.pkt_in_fly_roll_std = sqrtf(xqc_max(0.0f, pkt_var));
+    features[12] = features[9] / (features[8] + eps);
+    if (features[12] < 0.0f) features[12] = 0.0f;
+    if (features[12] > 2.0f) features[12] = 2.0f;
 
-    xqc_ml_cc_update_window(ml_cc, &features);
+    features[13] = features[3] / (features[7] / 1000.0f + eps);
+    if (features[13] < 0.0f) features[13] = 0.0f;
+    if (features[13] > 10000.0f) features[13] = 10000.0f;
 
-    ml_cc->last_prediction = xqc_ml_cc_run_inference(ml_cc);
+    features[14] = features[1] - features[4];
+    if (features[14] < -100.0f) features[14] = -100.0f;
+    if (features[14] > 100.0f) features[14] = 100.0f;
+
+    xqc_ml_cc_update_window(ml_cc, features);
+
+    if (!ml_cc->is_frozen) {
+        xqc_ml_cc_run_inference(ml_cc);
+        ml_cc->last_state = xqc_ml_cc_determine_state(ml_cc);
+    }
+
     ml_cc->last_rtt = adjusted_rtt;
-
-    xqc_log(ml_cc->log, XQC_LOG_REPORT,
-        "|ml_cc|feed_features|rtt:%.2f|loss:%.2f/%.2f|cwnd:%.0f|pkt_fly:%.0f|queue_pct:%.2f|recovery_elapsed:%ui|",
-        features.adjusted_rtt, features.short_loss_rate, features.long_loss_rate,
-        features.cwnd, features.pkt_in_fly, ml_cc->last_prediction,
-        (ml_cc->congestion_recovery_start_time > 0) ? 
-            (uint32_t)((xqc_monotonic_timestamp() - ml_cc->congestion_recovery_start_time) / 1000) : 0);
 }
 
 static size_t
@@ -447,12 +362,16 @@ xqc_ml_cc_init(void *cong, xqc_send_ctl_t *ctl_ctx, xqc_cc_params_t cc_params)
     ml_cc->last_rtt = 0;
     ml_cc->loss_reduction_factor = 0.0f;
 
-    memset(ml_cc->history_window, 0, sizeof(ml_cc->history_window));
+    ml_cc->last_state = XQC_ML_CC_STATE_NONE;
+    ml_cc->qu_consecutive_count = 0;
+    ml_cc->is_frozen = XQC_FALSE;
+    ml_cc->freeze_start_time = 0;
+    ml_cc->last_state = XQC_ML_CC_STATE_NONE;
+    ml_cc->frozen_cwnd = ml_cc->cwnd_bytes;
+    ml_cc->loss_spike_during_freeze = XQC_FALSE;
 
-    for (int i = 0; i < XQC_ML_CC_NUM_FEATURES; i++) {
-        ml_cc->scaler_mean[i] = 0.0f;
-        ml_cc->scaler_scale[i] = 1.0f;
-    }
+    memset(ml_cc->history_window, 0, sizeof(ml_cc->history_window));
+    memset(ml_cc->state_probs, 0, sizeof(ml_cc->state_probs));
 
 #ifdef XQC_ENABLE_ONNX
     ml_cc->onnx_api = (void *)OrtGetApiBase()->GetApi(ORT_API_VERSION);
@@ -467,7 +386,7 @@ xqc_ml_cc_init(void *cong, xqc_send_ctl_t *ctl_ctx, xqc_cc_params_t cc_params)
         if (status == NULL && env) {
             OrtSession *session = NULL;
             status = api->CreateSession(
-                env, 
+                env,
                 XQC_ONNX_MODEL_PATH,
                 NULL,
                 &session);
@@ -478,30 +397,16 @@ xqc_ml_cc_init(void *cong, xqc_send_ctl_t *ctl_ctx, xqc_cc_params_t cc_params)
             api->ReleaseEnv(env);
         }
     }
-
-    if (ml_cc->onnx_session) {
-        char model_path_mean[256];
-        char model_path_scale[256];
-        snprintf(model_path_mean, sizeof(model_path_mean), 
-                 "%s/scaler_mean.npy", XQC_ONNX_MODEL_DIR);
-        snprintf(model_path_scale, sizeof(model_path_scale), 
-                 "%s/scaler_scale.npy", XQC_ONNX_MODEL_DIR);
-
-        xqc_ml_cc_load_npy(model_path_mean, ml_cc->scaler_mean, XQC_ML_CC_NUM_FEATURES);
-        xqc_ml_cc_load_npy(model_path_scale, ml_cc->scaler_scale, XQC_ML_CC_NUM_FEATURES);
-    }
 #else
     ml_cc->onnx_session = NULL;
     ml_cc->onnx_api = NULL;
 #endif
 
     xqc_log(ml_cc->log, XQC_LOG_DEBUG,
-            "|ml_cc|initialized|cwnd:%u|onnx:%d|threshold_loss:%.1f|threshold_k:%.1f|recovery_rtt:%d|",
+            "|ml_cc|initialized|cwnd:%u|onnx:%d|qu_threshold:%d|",
             (uint32_t)ml_cc->cwnd_bytes,
             ml_cc->onnx_session != NULL ? 1 : 0,
-            XQC_ML_CC_QUEUE_THRESHOLD_LOSS,
-            XQC_ML_CC_QUEUE_THRESHOLD_K,
-            XQC_ML_CC_RECOVERY_RTT);
+            XQC_ML_CC_QU_CONSECUTIVE_THRESHOLD);
 }
 
 static void
@@ -509,86 +414,107 @@ xqc_ml_cc_on_ack(void *cong, xqc_packet_out_t *po, xqc_usec_t now)
 {
     xqc_ml_cc_t *ml_cc = (xqc_ml_cc_t *)cong;
 
-    xqc_usec_t elapsed = 0;
-    if (ml_cc->congestion_recovery_start_time > 0) {
-        elapsed = now - ml_cc->congestion_recovery_start_time;
+    if (ml_cc->is_frozen) {
+        xqc_usec_t elapsed = now - ml_cc->freeze_start_time;
+        double short_loss_rate = 0.0;
+
+        xqc_send_ctl_t *ctl = ml_cc->send_ctl;
+        if (ctl && ctl->ctl_recent_send_count[0] > 0) {
+            short_loss_rate = (double)ctl->ctl_recent_lost_count[0] / ctl->ctl_recent_send_count[0] * 100.0;
+        }
+
+        if (elapsed < XQC_ML_CC_NH_FREEZE_DURATION) {
+            if (short_loss_rate > XQC_ML_CC_NH_LOSS_HIGH) {
+                ml_cc->loss_spike_during_freeze = XQC_TRUE;
+            }
+        } else {
+            if (!ml_cc->loss_spike_during_freeze) {
+                ml_cc->is_frozen = XQC_FALSE;
+                xqc_log(ml_cc->log, XQC_LOG_DEBUG,
+                        "|ml_cc|frozen_exit|elapsed:%ui|no_loss_spike|",
+                        (uint32_t)elapsed);
+            } else if (short_loss_rate < XQC_ML_CC_NH_LOSS_LOW) {
+                ml_cc->is_frozen = XQC_FALSE;
+                ml_cc->loss_spike_during_freeze = XQC_FALSE;
+                xqc_log(ml_cc->log, XQC_LOG_DEBUG,
+                        "|ml_cc|frozen_exit|elapsed:%ui|loss_below_threshold|",
+                        (uint32_t)elapsed);
+            }
+        }
+
+        if (ml_cc->is_frozen) {
+            ml_cc->cwnd_bytes = ml_cc->frozen_cwnd;
+            xqc_log(ml_cc->log, XQC_LOG_DEBUG,
+                    "|ml_cc|frozen|elapsed:%ui|loss:%.2f|spike:%d|cwnd:%u|",
+                    (uint32_t)elapsed, short_loss_rate,
+                    ml_cc->loss_spike_during_freeze ? 1 : 0,
+                    (uint32_t)ml_cc->cwnd_bytes);
+            return;
+        }
     }
 
-    if (ml_cc->last_rtt > 0 && 
-        elapsed < ml_cc->last_rtt * XQC_ML_CC_RECOVERY_RTT) {
+    xqc_ml_cc_state_t state = ml_cc->last_state;
+
+    if (state == XQC_ML_CC_STATE_NH) {
+        ml_cc->frozen_cwnd = ml_cc->cwnd_bytes * XQC_ML_CC_NH_FREEZE_CWND_FACTOR;
+        ml_cc->cwnd_bytes = ml_cc->frozen_cwnd;
+        ml_cc->is_frozen = XQC_TRUE;
+        ml_cc->freeze_start_time = now;
+        ml_cc->loss_spike_during_freeze = XQC_FALSE;
+
         xqc_log(ml_cc->log, XQC_LOG_DEBUG,
-                "|ml_cc|on_ack|in_recovery|elapsed:%ui|recovery_window:%ui|cwnd:%u|",
-                (uint32_t)elapsed, 
-                (uint32_t)(ml_cc->last_rtt * XQC_ML_CC_RECOVERY_RTT),
-                (uint32_t)ml_cc->cwnd_bytes);
+                "|ml_cc|nh_enter|frozen_cwnd:%u|prob_nh:%.3f|",
+                (uint32_t)ml_cc->frozen_cwnd, ml_cc->state_probs[3]);
         return;
     }
 
-    float queue_pct = ml_cc->last_prediction;
-    float cwnd_gain = 1.0f;
+    if (state == XQC_ML_CC_STATE_UT) {
+        ml_cc->qu_consecutive_count = 0;
+        float ack_bytes = 0.0f;
+        if (po) {
+            ack_bytes = (float)po->po_used_size;
+        }
+        ml_cc->cwnd_bytes += ack_bytes * XQC_ML_CC_UT_CWND_GAIN;
 
-    if (queue_pct <= XQC_ML_CC_QUEUE_THRESHOLD_LOSS) {
-        cwnd_gain = 1.0f;
+        xqc_log(ml_cc->log, XQC_LOG_DEBUG,
+                "|ml_cc|ut_state|gain:%.2f|cwnd:%u|",
+                XQC_ML_CC_UT_CWND_GAIN, (uint32_t)ml_cc->cwnd_bytes);
 
-    } else if (queue_pct < XQC_ML_CC_QUEUE_THRESHOLD_K) {
-        float t = (queue_pct - XQC_ML_CC_QUEUE_THRESHOLD_LOSS) / 
-                  (XQC_ML_CC_QUEUE_THRESHOLD_K - XQC_ML_CC_QUEUE_THRESHOLD_LOSS);
-        cwnd_gain = 1.1f - t * 0.1f;
+    } else if (state == XQC_ML_CC_STATE_QU) {
+        ml_cc->qu_consecutive_count++;
 
-    } else {
-        float t = (queue_pct - XQC_ML_CC_QUEUE_THRESHOLD_K) / 
-                  (100.0f - XQC_ML_CC_QUEUE_THRESHOLD_K);
-        cwnd_gain = 1.0f - t * 0.5f;
-        cwnd_gain = xqc_max(cwnd_gain, 0.5f);
+        if (ml_cc->qu_consecutive_count >= XQC_ML_CC_QU_CONSECUTIVE_THRESHOLD) {
+            ml_cc->cwnd_bytes *= XQC_ML_CC_QU_CWND_DECREASE;
+            if (ml_cc->cwnd_bytes < ml_cc->min_cwnd_bytes) {
+                ml_cc->cwnd_bytes = ml_cc->min_cwnd_bytes;
+            }
+            ml_cc->qu_consecutive_count = 0;
+
+            xqc_log(ml_cc->log, XQC_LOG_DEBUG,
+                    "|ml_cc|qu_state|decrease|cwnd:%u|qu_count:%d|",
+                    (uint32_t)ml_cc->cwnd_bytes, ml_cc->qu_consecutive_count);
+        }
+
+    } else if (state == XQC_ML_CC_STATE_EB) {
+        ml_cc->qu_consecutive_count = 0;
+        ml_cc->cwnd_bytes *= XQC_ML_CC_EB_CWND_DECREASE;
+        if (ml_cc->cwnd_bytes < ml_cc->min_cwnd_bytes) {
+            ml_cc->cwnd_bytes = ml_cc->min_cwnd_bytes;
+        }
+
+        xqc_log(ml_cc->log, XQC_LOG_DEBUG,
+                "|ml_cc|eb_state|decrease|cwnd:%u|",
+                (uint32_t)ml_cc->cwnd_bytes);
     }
 
-    float ack_bytes = 0.0f;
-    if (po) {
-        ack_bytes = (float)po->po_used_size;
+    if (ml_cc->cwnd_bytes > XQC_ML_CC_MAX_CWND) {
+        ml_cc->cwnd_bytes = XQC_ML_CC_MAX_CWND;
     }
-
-    float target_cwnd = ml_cc->cwnd_bytes + ack_bytes * cwnd_gain;
-    target_cwnd = xqc_min(target_cwnd, (float)XQC_ML_CC_MAX_CWND);
-
-    ml_cc->cwnd_bytes = target_cwnd;
-
-    xqc_log(ml_cc->log, XQC_LOG_DEBUG,
-            "|ml_cc|on_ack|queue_pct:%.2f|gain:%.3f|cwnd:%u|ack_bytes:%u|recovery:%d|",
-            queue_pct, cwnd_gain, (uint32_t)ml_cc->cwnd_bytes, 
-            (uint32_t)ack_bytes, 
-            (ml_cc->congestion_recovery_start_time > 0 && 
-             elapsed < ml_cc->last_rtt * XQC_ML_CC_RECOVERY_RTT) ? 1 : 0);
 }
 
 static void
 xqc_ml_cc_on_lost(void *cong, xqc_usec_t lost_sent_time)
 {
-    xqc_ml_cc_t *ml_cc = (xqc_ml_cc_t *)cong;
-
-    float queue_pct = ml_cc->last_prediction;
-
-    if (queue_pct > XQC_ML_CC_QUEUE_THRESHOLD_LOSS) {
-        float t = (queue_pct - XQC_ML_CC_QUEUE_THRESHOLD_LOSS) / 
-                  (100.0f - XQC_ML_CC_QUEUE_THRESHOLD_LOSS);
-        float reduction_factor = 0.7f + t * 0.25f;
-        reduction_factor = xqc_min(reduction_factor, 0.95f);
-
-        ml_cc->loss_reduction_factor = reduction_factor;
-        ml_cc->cwnd_bytes = xqc_max(
-            ml_cc->min_cwnd_bytes,
-            ml_cc->cwnd_bytes * reduction_factor);
-
-        ml_cc->congestion_recovery_start_time = xqc_monotonic_timestamp();
-
-        xqc_log(ml_cc->log, XQC_LOG_DEBUG,
-                "|ml_cc|on_lost|reduction:%.3f|cwnd:%u|queue_pct:%.2f|recovery_start|",
-                reduction_factor, (uint32_t)ml_cc->cwnd_bytes, queue_pct);
-
-    } else {
-        xqc_log(ml_cc->log, XQC_LOG_DEBUG,
-                "|ml_cc|on_lost|skip|cwnd:%u|queue_pct:%.2f|below_threshold|",
-                (uint32_t)ml_cc->cwnd_bytes, queue_pct);
-    }
 }
 
 static uint64_t

@@ -387,14 +387,14 @@ if(XQC_ENABLE_ML_CC)
     )
 
     if(NOT ONNX_MODEL_DIR)
-        set(ONNX_MODEL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/queue_predict/deployment")
+        set(ONNX_MODEL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/state_predict/onnx_export")
     endif()
 
     if(NOT ONNX_RUNTIME_DIR)
         set(ONNX_RUNTIME_DIR "/usr/local")
     endif()
 
-    set(ONNX_MODEL_PATH "${ONNX_MODEL_DIR}/queue_predictor.onnx")
+    set(ONNX_MODEL_PATH "${ONNX_MODEL_DIR}/state_prediction_no_validation.onnx")
 
     add_definitions(-DXQC_ENABLE_ONNX)
     add_definitions(-DXQC_ONNX_MODEL_DIR="${ONNX_MODEL_DIR}")
