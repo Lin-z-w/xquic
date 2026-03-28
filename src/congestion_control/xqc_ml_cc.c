@@ -60,6 +60,16 @@ xqc_ml_cc_clamp_float(float value, float min_value, float max_value)
     return value;
 }
 
+static xqc_log_t *
+xqc_ml_cc_get_log(xqc_ml_cc_t *ml_cc)
+{
+    if (ml_cc == NULL || ml_cc->send_ctl == NULL || ml_cc->send_ctl->ctl_conn == NULL) {
+        return NULL;
+    }
+
+    return ml_cc->send_ctl->ctl_conn->log;
+}
+
 static const char *
 xqc_ml_cc_state_to_str(xqc_ml_cc_state_t state)
 {
@@ -429,7 +439,7 @@ xqc_ml_cc_apply_qu_fallback(xqc_ml_cc_t *ml_cc)
         ml_cc->qu_consecutive_count = 0;
         xqc_ml_cc_clamp_cwnd(ml_cc);
 
-        xqc_log(ml_cc->log, XQC_LOG_DEBUG,
+        xqc_log(xqc_ml_cc_get_log(ml_cc), XQC_LOG_DEBUG,
                 "|ml_cc|qu_fallback|cwnd:%u|threshold:%d|",
                 (uint32_t)ml_cc->cwnd_bytes,
                 XQC_ML_CC_QU_CONSECUTIVE_THRESHOLD);
@@ -498,7 +508,7 @@ xqc_ml_cc_apply_qu_fine_grained_control(xqc_ml_cc_t *ml_cc, xqc_packet_out_t *po
 
     xqc_ml_cc_clamp_cwnd(ml_cc);
 
-    xqc_log(ml_cc->log, XQC_LOG_DEBUG,
+    xqc_log(xqc_ml_cc_get_log(ml_cc), XQC_LOG_DEBUG,
             "|ml_cc|qu_fine|mode:%s|prob_qu:%.3f|queue_raw:%.3f|queue_ema:%.3f|"
             "queue_k:%.3f|grow:%.3f|drain:%.3f|acked:%.1f|cwnd_before:%u|cwnd_after:%u|",
             mode, ml_cc->state_probs[XQC_ML_CC_STATE_QU], ml_cc->queue_depth_raw,
@@ -533,7 +543,7 @@ xqc_ml_cc_feed_features(void *cong, xqc_usec_t ack_recv_time,
         xqc_ml_cc_state_t prev_state = ml_cc->last_state;
         xqc_ml_cc_run_state_inference(ml_cc);
         ml_cc->last_state = xqc_ml_cc_determine_state(ml_cc);
-        xqc_log(ml_cc->log, XQC_LOG_DEBUG,
+        xqc_log(xqc_ml_cc_get_log(ml_cc), XQC_LOG_DEBUG,
                 "|ml_cc|state_update|prev_state:%s|state:%s|"
                 "prob_ut:%.3f|prob_qu:%.3f|prob_eb:%.3f|prob_nh:%.3f|"
                 "adjusted_rtt:%ui|short_loss:%.2f|long_loss:%.2f|cwnd:%ui|pkt_in_fly:%ud|samples:%d|",
@@ -562,7 +572,6 @@ xqc_ml_cc_init(void *cong, xqc_send_ctl_t *ctl_ctx, xqc_cc_params_t cc_params)
     xqc_ml_cc_t *ml_cc = (xqc_ml_cc_t *)cong;
 
     ml_cc->send_ctl = ctl_ctx;
-    ml_cc->log = ctl_ctx->ctl_conn->log;
     ml_cc->init_cwnd_bytes = XQC_ML_CC_INIT_WIN;
     ml_cc->min_cwnd_bytes = XQC_ML_CC_MIN_CWND;
 
@@ -619,7 +628,7 @@ xqc_ml_cc_init(void *cong, xqc_send_ctl_t *ctl_ctx, xqc_cc_params_t cc_params)
     ml_cc->queue_model_ready = 0;
 #endif
 
-    xqc_log(ml_cc->log, XQC_LOG_DEBUG,
+    xqc_log(xqc_ml_cc_get_log(ml_cc), XQC_LOG_DEBUG,
             "|ml_cc|initialized|cwnd:%u|state_onnx:%d|queue_onnx:%d|queue_k:%.2f|",
             (uint32_t)ml_cc->cwnd_bytes,
             ml_cc->onnx_session != NULL ? 1 : 0,
@@ -649,13 +658,13 @@ xqc_ml_cc_on_ack(void *cong, xqc_packet_out_t *po, xqc_usec_t now)
         } else {
             if (!ml_cc->loss_spike_during_freeze) {
                 ml_cc->is_frozen = XQC_FALSE;
-                xqc_log(ml_cc->log, XQC_LOG_DEBUG,
+                xqc_log(xqc_ml_cc_get_log(ml_cc), XQC_LOG_DEBUG,
                         "|ml_cc|frozen_exit|elapsed:%ui|no_loss_spike|",
                         (uint32_t)elapsed);
             } else if (short_loss_rate < XQC_ML_CC_NH_LOSS_LOW) {
                 ml_cc->is_frozen = XQC_FALSE;
                 ml_cc->loss_spike_during_freeze = XQC_FALSE;
-                xqc_log(ml_cc->log, XQC_LOG_DEBUG,
+                xqc_log(xqc_ml_cc_get_log(ml_cc), XQC_LOG_DEBUG,
                         "|ml_cc|frozen_exit|elapsed:%ui|loss_below_threshold|",
                         (uint32_t)elapsed);
             }
@@ -663,7 +672,7 @@ xqc_ml_cc_on_ack(void *cong, xqc_packet_out_t *po, xqc_usec_t now)
 
         if (ml_cc->is_frozen) {
             ml_cc->cwnd_bytes = ml_cc->frozen_cwnd;
-            xqc_log(ml_cc->log, XQC_LOG_DEBUG,
+            xqc_log(xqc_ml_cc_get_log(ml_cc), XQC_LOG_DEBUG,
                     "|ml_cc|frozen|elapsed:%ui|loss:%.2f|spike:%d|cwnd:%u|",
                     (uint32_t)elapsed, short_loss_rate,
                     ml_cc->loss_spike_during_freeze ? 1 : 0,
@@ -679,7 +688,7 @@ xqc_ml_cc_on_ack(void *cong, xqc_packet_out_t *po, xqc_usec_t now)
         ml_cc->freeze_start_time = now;
         ml_cc->loss_spike_during_freeze = XQC_FALSE;
 
-        xqc_log(ml_cc->log, XQC_LOG_DEBUG,
+        xqc_log(xqc_ml_cc_get_log(ml_cc), XQC_LOG_DEBUG,
                 "|ml_cc|nh_enter|frozen_cwnd:%u|prob_nh:%.3f|",
                 (uint32_t)ml_cc->frozen_cwnd, ml_cc->state_probs[3]);
         return;
@@ -691,7 +700,7 @@ xqc_ml_cc_on_ack(void *cong, xqc_packet_out_t *po, xqc_usec_t now)
         ml_cc->cwnd_bytes += acked * XQC_ML_CC_UT_CWND_GAIN;
         xqc_ml_cc_clamp_cwnd(ml_cc);
 
-        xqc_log(ml_cc->log, XQC_LOG_DEBUG,
+        xqc_log(xqc_ml_cc_get_log(ml_cc), XQC_LOG_DEBUG,
                 "|ml_cc|ut_state|gain:%.2f|acked:%.1f|cwnd:%u|",
                 XQC_ML_CC_UT_CWND_GAIN, acked, (uint32_t)ml_cc->cwnd_bytes);
         return;
@@ -711,7 +720,7 @@ xqc_ml_cc_on_ack(void *cong, xqc_packet_out_t *po, xqc_usec_t now)
                 (1.0f - XQC_ML_CC_QU_QUEUE_EMA_ALPHA) * ml_cc->queue_depth_ema
                 + XQC_ML_CC_QU_QUEUE_EMA_ALPHA * queue_depth,
                 0.0f, 1.0f);
-            xqc_log(ml_cc->log, XQC_LOG_DEBUG,
+            xqc_log(xqc_ml_cc_get_log(ml_cc), XQC_LOG_DEBUG,
                     "|ml_cc|queue_update|state:%s|prob_qu:%.3f|queue_raw:%.3f|"
                     "queue_ema_prev:%.3f|queue_ema:%.3f|queue_k:%.3f|",
                     xqc_ml_cc_state_to_str(ml_cc->last_state),
@@ -731,7 +740,7 @@ xqc_ml_cc_on_ack(void *cong, xqc_packet_out_t *po, xqc_usec_t now)
         ml_cc->cwnd_bytes *= XQC_ML_CC_EB_CWND_DECREASE;
         xqc_ml_cc_clamp_cwnd(ml_cc);
 
-        xqc_log(ml_cc->log, XQC_LOG_DEBUG,
+        xqc_log(xqc_ml_cc_get_log(ml_cc), XQC_LOG_DEBUG,
                 "|ml_cc|eb_state|decrease|cwnd:%u|",
                 (uint32_t)ml_cc->cwnd_bytes);
         return;

@@ -48,7 +48,6 @@ typedef enum {
 
 typedef struct xqc_ml_cc_s {
     xqc_send_ctl_t         *send_ctl;
-    xqc_log_t              *log;
 
     float                   cwnd_bytes;
     float                   init_cwnd_bytes;
