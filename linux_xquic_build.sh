@@ -1,21 +1,35 @@
 #!/bin/bash
 
-if [ -d "build" ]; then
-    sudo rm -r build/ 
-fi
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BUILD_DIR="${ROOT_DIR}/build"
 
 SSL_TYPE_STR="boringssl"
-SSL_PATH_STR="/home/cnic/lzw/xquic/third_party/boringssl"
+SSL_PATH_STR="${ROOT_DIR}/third_party/boringssl"
 
 ONNX_RUNTIME_DIR="/usr/local/onnxruntime-linux-x64-1.24.4"
-ONNX_MODEL_DIR="/home/cnic/lzw/xquic/third_party/queue_predict/deployment"
+ONNX_MODEL_DIR="${ROOT_DIR}/third_party/state_predict/onnx_export"
+STATE_MODEL_PATH="${ONNX_MODEL_DIR}/state_prediction_no_validation.onnx"
+QUEUE_MODEL_PATH="${ONNX_MODEL_DIR}/qu_queue_depth/qu_queue_depth_regressor.onnx"
 
-# build XQUIC with BoringSSL
-# When build XQUIC with boringssl, by default XQUIC will use boringssl
-# in third_party. If boringssl is deployed in other directories, SSL_PATH could be 
-# used to specify the search path of boringssl
-git submodule update --init --recursive
-mkdir -p build; cd build
+if [ ! -f "${STATE_MODEL_PATH}" ]; then
+    echo "state model not found: ${STATE_MODEL_PATH}"
+    exit 1
+fi
+
+if [ ! -f "${QUEUE_MODEL_PATH}" ]; then
+    echo "queue model not found: ${QUEUE_MODEL_PATH}"
+    exit 1
+fi
+
+rm -rf "${BUILD_DIR}"
+
+git -C "${ROOT_DIR}" submodule update --init --recursive
+
+mkdir -p "${BUILD_DIR}"
+cd "${BUILD_DIR}"
+
 cmake -DGCOV=off \
     -DCMAKE_BUILD_TYPE=Debug \
     -DXQC_ENABLE_TESTING=1 \
@@ -28,15 +42,10 @@ cmake -DGCOV=off \
     -DXQC_ENABLE_ML_CC=1 \
     -DXQC_ENABLE_UNLIMITED=1 \
     -DXQC_PRINT_SECRET=1 \
-    -DSSL_TYPE=${SSL_TYPE_STR} \
-    -DSSL_PATH=${SSL_PATH_STR} \
-    -DONNX_RUNTIME_DIR=${ONNX_RUNTIME_DIR} \
-    -DONNX_MODEL_DIR=${ONNX_MODEL_DIR} ..
+    -DSSL_TYPE="${SSL_TYPE_STR}" \
+    -DSSL_PATH="${SSL_PATH_STR}" \
+    -DONNX_RUNTIME_DIR="${ONNX_RUNTIME_DIR}" \
+    -DONNX_MODEL_DIR="${ONNX_MODEL_DIR}" \
+    "${ROOT_DIR}"
 
-# exit if cmake error
-if [ $? -ne 0 ]; then
-    echo "cmake failed"
-    exit 1
-fi
-
-make -j
+make -j"$(nproc)"
