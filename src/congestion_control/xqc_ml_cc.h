@@ -80,6 +80,7 @@ typedef struct xqc_ml_cc_s {
     float                   queue_threshold_k;
     int                     queue_model_enabled;
     int                     queue_model_ready;
+    int                     state_model_ready;
 
 } xqc_ml_cc_t;
 

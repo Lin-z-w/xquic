@@ -70,6 +70,57 @@ xqc_ml_cc_get_log(xqc_ml_cc_t *ml_cc)
     return ml_cc->send_ctl->ctl_conn->log;
 }
 
+#ifdef XQC_ENABLE_ONNX
+static void
+xqc_ml_cc_log_onnx_failure(xqc_ml_cc_t *ml_cc, const char *model_tag,
+    const char *phase, const char *detail, const char *output_name)
+{
+    xqc_log_t *log = xqc_ml_cc_get_log(ml_cc);
+
+    if (log == NULL) {
+        return;
+    }
+
+    xqc_log(log, XQC_LOG_REPORT,
+            "|ml_cc|onnx_fail|model:%s|phase:%s|detail:%s|output:%s|samples:%d|"
+            "window:%d|state_ready:%d|queue_ready:%d|",
+            model_tag != NULL ? model_tag : "unknown",
+            phase != NULL ? phase : "unknown",
+            detail != NULL ? detail : "unknown",
+            output_name != NULL ? output_name : "null",
+            ml_cc != NULL ? ml_cc->sample_count : -1, XQC_ML_CC_WINDOW_SIZE,
+            ml_cc != NULL ? ml_cc->state_model_ready : 0,
+            ml_cc != NULL ? ml_cc->queue_model_ready : 0);
+}
+
+static void
+xqc_ml_cc_log_ort_status(xqc_ml_cc_t *ml_cc, const OrtApi *api,
+    OrtStatus *status, const char *model_tag, const char *phase,
+    const char *output_name, const char *model_path)
+{
+    const char *msg = "unknown";
+    xqc_log_t *log = xqc_ml_cc_get_log(ml_cc);
+
+    if (log == NULL) {
+        return;
+    }
+
+    if (api != NULL && status != NULL) {
+        msg = api->GetErrorMessage(status);
+    }
+
+    xqc_log(log, XQC_LOG_REPORT,
+            "|ml_cc|onnx_fail|model:%s|phase:%s|path:%s|output:%s|samples:%d|"
+            "window:%d|msg:%s|",
+            model_tag != NULL ? model_tag : "unknown",
+            phase != NULL ? phase : "unknown",
+            model_path != NULL ? model_path : "null",
+            output_name != NULL ? output_name : "null",
+            ml_cc != NULL ? ml_cc->sample_count : -1, XQC_ML_CC_WINDOW_SIZE,
+            msg != NULL ? msg : "unknown");
+}
+#endif
+
 static const char *
 xqc_ml_cc_state_to_str(xqc_ml_cc_state_t state)
 {
@@ -267,7 +318,8 @@ xqc_ml_cc_determine_state(xqc_ml_cc_t *ml_cc)
 
 #ifdef XQC_ENABLE_ONNX
 static OrtSession *
-xqc_ml_cc_create_session(const OrtApi *api, const char *model_path)
+xqc_ml_cc_create_session(xqc_ml_cc_t *ml_cc, const OrtApi *api,
+    const char *model_tag, const char *model_path)
 {
     OrtEnv *env = NULL;
     OrtSessionOptions *options = NULL;
@@ -275,20 +327,30 @@ xqc_ml_cc_create_session(const OrtApi *api, const char *model_path)
     OrtStatus *status = NULL;
 
     if (api == NULL || model_path == NULL) {
+        xqc_ml_cc_log_onnx_failure(ml_cc, model_tag, "create_session",
+            "invalid_api_or_model_path", NULL);
         return NULL;
     }
 
     status = api->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "xqc_ml_cc", &env);
     if (status != NULL) {
+        xqc_ml_cc_log_ort_status(ml_cc, api, status, model_tag,
+            "create_env", NULL, model_path);
         goto end;
     }
 
     status = api->CreateSessionOptions(&options);
     if (status != NULL) {
+        xqc_ml_cc_log_ort_status(ml_cc, api, status, model_tag,
+            "create_session_options", NULL, model_path);
         goto end;
     }
 
     status = api->CreateSession(env, model_path, options, &session);
+    if (status != NULL) {
+        xqc_ml_cc_log_ort_status(ml_cc, api, status, model_tag,
+            "create_session", NULL, model_path);
+    }
 
 end:
     if (status != NULL) {
@@ -306,7 +368,8 @@ end:
 
 static xqc_bool_t
 xqc_ml_cc_run_ort_inference(xqc_ml_cc_t *ml_cc, void *session_ptr,
-    const char *output_name, const float *mean, const float *scale,
+    const char *model_tag, const char *output_name, const float *mean,
+    const float *scale,
     float *output, size_t output_len)
 {
     const OrtApi *api;
@@ -324,12 +387,25 @@ xqc_ml_cc_run_ort_inference(xqc_ml_cc_t *ml_cc, void *session_ptr,
     size_t i;
     xqc_bool_t ret = XQC_FALSE;
 
-    if (ml_cc->sample_count < XQC_ML_CC_WINDOW_SIZE
-        || session_ptr == NULL
-        || ml_cc->onnx_api == NULL
-        || output == NULL
-        || output_name == NULL)
-    {
+    if (ml_cc->sample_count < XQC_ML_CC_WINDOW_SIZE) {
+        return XQC_FALSE;
+    }
+
+    if (session_ptr == NULL) {
+        xqc_ml_cc_log_onnx_failure(ml_cc, model_tag, "precheck",
+            "null_session", output_name);
+        return XQC_FALSE;
+    }
+
+    if (ml_cc->onnx_api == NULL) {
+        xqc_ml_cc_log_onnx_failure(ml_cc, model_tag, "precheck",
+            "null_onnx_api", output_name);
+        return XQC_FALSE;
+    }
+
+    if (output == NULL || output_name == NULL) {
+        xqc_ml_cc_log_onnx_failure(ml_cc, model_tag, "precheck",
+            "invalid_output_buffer", output_name);
         return XQC_FALSE;
     }
 
@@ -340,12 +416,16 @@ xqc_ml_cc_run_ort_inference(xqc_ml_cc_t *ml_cc, void *session_ptr,
 
     status = api->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &mem_info);
     if (status != NULL) {
+        xqc_ml_cc_log_ort_status(ml_cc, api, status, model_tag,
+            "create_cpu_memory_info", output_name, NULL);
         goto end;
     }
 
     status = api->CreateTensorWithDataAsOrtValue(mem_info, input, sizeof(input),
         input_shape, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_tensor);
     if (status != NULL) {
+        xqc_ml_cc_log_ort_status(ml_cc, api, status, model_tag,
+            "create_input_tensor", output_name, NULL);
         goto end;
     }
 
@@ -354,17 +434,29 @@ xqc_ml_cc_run_ort_inference(xqc_ml_cc_t *ml_cc, void *session_ptr,
     status = api->Run(session, NULL, input_names, input_values, 1,
         output_names, 1, &output_tensor);
     if (status != NULL) {
+        xqc_ml_cc_log_ort_status(ml_cc, api, status, model_tag,
+            "run", output_name, NULL);
         goto end;
     }
 
     status = api->GetTensorMutableData(output_tensor, (void **)&output_data);
-    if (status != NULL || output_data == NULL) {
+    if (status != NULL) {
+        xqc_ml_cc_log_ort_status(ml_cc, api, status, model_tag,
+            "get_tensor_data", output_name, NULL);
+        goto end;
+    }
+
+    if (output_data == NULL) {
+        xqc_ml_cc_log_onnx_failure(ml_cc, model_tag, "get_tensor_data",
+            "null_output_data", output_name);
         goto end;
     }
 
     for (i = 0; i < output_len; i++) {
         output[i] = output_data[i];
         if (!isfinite(output[i])) {
+            xqc_ml_cc_log_onnx_failure(ml_cc, model_tag, "validate_output",
+                "nonfinite_output", output_name);
             goto end;
         }
     }
@@ -392,8 +484,9 @@ xqc_ml_cc_run_state_inference(xqc_ml_cc_t *ml_cc)
 {
     float logits[4];
 
-    if (!xqc_ml_cc_run_ort_inference(ml_cc, ml_cc->onnx_session, "output",
-            xqc_ml_cc_scaler_mean, xqc_ml_cc_scaler_scale, logits, 4))
+    if (!xqc_ml_cc_run_ort_inference(ml_cc, ml_cc->onnx_session, "state",
+            "output", xqc_ml_cc_scaler_mean, xqc_ml_cc_scaler_scale, logits,
+            4))
     {
         xqc_ml_cc_set_uniform_probs(ml_cc);
         return;
@@ -408,7 +501,7 @@ xqc_ml_cc_run_qu_queue_inference(xqc_ml_cc_t *ml_cc, float *queue_depth)
     float raw_output = 0.0f;
 
     if (!xqc_ml_cc_run_ort_inference(ml_cc, ml_cc->queue_onnx_session,
-            "queue_depth_percentage", xqc_ml_cc_qu_scaler_mean,
+            "queue", "queue_depth_percentage", xqc_ml_cc_qu_scaler_mean,
             xqc_ml_cc_qu_scaler_scale, &raw_output, 1))
     {
         return XQC_FALSE;
@@ -607,6 +700,7 @@ xqc_ml_cc_init(void *cong, xqc_send_ctl_t *ctl_ctx, xqc_cc_params_t cc_params)
     ml_cc->queue_threshold_k = XQC_ML_CC_QU_QUEUE_K;
     ml_cc->queue_model_enabled = 1;
     ml_cc->queue_model_ready = 0;
+    ml_cc->state_model_ready = 0;
 
     memset(ml_cc->history_window, 0, sizeof(ml_cc->history_window));
     memset(ml_cc->state_probs, 0, sizeof(ml_cc->state_probs));
@@ -618,25 +712,42 @@ xqc_ml_cc_init(void *cong, xqc_send_ctl_t *ctl_ctx, xqc_cc_params_t cc_params)
 
     if (ml_cc->onnx_api != NULL) {
         const OrtApi *api = (const OrtApi *)ml_cc->onnx_api;
-        ml_cc->onnx_session = (void *)xqc_ml_cc_create_session(api, XQC_ONNX_MODEL_PATH);
+        ml_cc->onnx_session = (void *)xqc_ml_cc_create_session(ml_cc, api,
+            "state", XQC_ONNX_MODEL_PATH);
 #ifdef XQC_ONNX_QUEUE_MODEL_PATH
-        ml_cc->queue_onnx_session = (void *)xqc_ml_cc_create_session(api, XQC_ONNX_QUEUE_MODEL_PATH);
+        ml_cc->queue_onnx_session = (void *)xqc_ml_cc_create_session(ml_cc,
+            api, "queue", XQC_ONNX_QUEUE_MODEL_PATH);
 #endif
+    } else {
+        xqc_ml_cc_log_onnx_failure(ml_cc, "state", "init",
+            "onnx_api_unavailable", NULL);
     }
 
+    ml_cc->state_model_ready = ml_cc->onnx_session != NULL ? 1 : 0;
     ml_cc->queue_model_ready = ml_cc->queue_onnx_session != NULL ? 1 : 0;
+
+    if (!ml_cc->state_model_ready) {
+        xqc_ml_cc_log_onnx_failure(ml_cc, "state", "init",
+            "state_model_session_unavailable", "output");
+    }
+
+    if (!ml_cc->queue_model_ready) {
+        xqc_ml_cc_log_onnx_failure(ml_cc, "queue", "init",
+            "queue_model_session_unavailable", "queue_depth_percentage");
+    }
 #else
     ml_cc->onnx_api = NULL;
     ml_cc->onnx_session = NULL;
     ml_cc->queue_onnx_session = NULL;
+    ml_cc->state_model_ready = 0;
     ml_cc->queue_model_ready = 0;
 #endif
 
     xqc_log(xqc_ml_cc_get_log(ml_cc), XQC_LOG_DEBUG,
             "|ml_cc|initialized|cwnd:%u|state_onnx:%d|queue_onnx:%d|queue_k:%.2f|",
             (uint32_t)ml_cc->cwnd_bytes,
-            ml_cc->onnx_session != NULL ? 1 : 0,
-            ml_cc->queue_onnx_session != NULL ? 1 : 0,
+            ml_cc->state_model_ready,
+            ml_cc->queue_model_ready,
             ml_cc->queue_threshold_k);
 }
 
