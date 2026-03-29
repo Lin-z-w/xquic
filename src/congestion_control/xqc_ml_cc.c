@@ -179,14 +179,18 @@ xqc_ml_cc_build_features(xqc_ml_cc_t *ml_cc, float *features,
         prev_cwnd = ml_cc->history_window[prev_idx][8];
     }
 
-    features[0] = (float)adjusted_rtt / 1000.0f;
+    /*
+     * state_predict 的 derived_v1_15 特征和配套 scaler 使用 RTT/响应间隔
+     * 的原始微秒量级；这里只保留原始值，避免和部署包统计量失配。
+     */
+    features[0] = (float)adjusted_rtt;
     features[1] = (float)short_loss_rate;
     features[2] = (float)short_lost_cnt;
     features[3] = (float)short_send_cnt;
     features[4] = (float)long_loss_rate;
     features[5] = (float)long_lost_cnt;
     features[6] = (float)long_send_cnt;
-    features[7] = (float)response_interval / 1000.0f;
+    features[7] = (float)response_interval;
     features[8] = (float)cwnd;
     features[9] = (float)pkt_in_fly;
     features[10] = features[0] - prev_rtt;

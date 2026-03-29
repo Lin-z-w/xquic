@@ -414,7 +414,9 @@ extern const float xqc_ml_cc_qu_scaler_scale[XQC_ML_CC_NUM_FEATURES];
 注意：
 
 - 当前文档显示回归模型使用 15 维特征。
-- 顶层 `state_predict` 元数据里存在 “分类模型 feature_names 为 18 项、输入维度却写 15” 的不一致现象。
+- 最新状态分类部署包已经改为同名 `metadata/provenance/scaler` 配套文件，优先以
+  `state_prediction_no_validation.metadata.json` 和
+  `state_prediction_no_validation.provenance.json` 为准。
 
 因此实现时建议以两个 ONNX 模型实际导出的输入维度和当前 `xqc_ml_cc.c` 已落地的 15 维特征为准，不要直接依赖顶层 README 的描述。
 

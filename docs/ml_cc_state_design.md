@@ -25,14 +25,14 @@
 
 | Index | Feature | 来源 |
 |-------|---------|------|
-| 0 | adjusted_rtt | ctl_srtt / 1000 |
+| 0 | adjusted_rtt | ctl_srtt（原始微秒值） |
 | 1 | short_loss_rate | lost[0] / send[0] |
 | 2 | short_lost_cnt | ctl_recent_lost_count[0] |
 | 3 | short_send_cnt | ctl_recent_send_count[0] |
 | 4 | long_loss_rate | (lost[0]+lost[1]) / (send[0]+send[1]) |
 | 5 | long_lost_cnt | lost[0] + lost[1] |
 | 6 | long_send_cnt | send[0] + send[1] |
-| 7 | response_interval | (delivered_time - first_sent_time) / 1000 |
+| 7 | response_interval | delivered_time - first_sent_time（原始微秒值） |
 | 8 | cwnd | ml_cc->cwnd_bytes |
 | 9 | pkt_in_fly | ctl_bytes_in_flight |
 | 10 | rtt_diff | adjusted_rtt - prev_rtt |
