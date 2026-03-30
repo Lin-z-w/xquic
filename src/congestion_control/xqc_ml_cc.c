@@ -721,8 +721,13 @@ xqc_ml_cc_feed_features(void *cong, xqc_usec_t ack_recv_time,
         case XQC_ML_CC_STATE_UT:
             ml_cc->qu_consecutive_count = 0;
             ml_cc->eb_consecutive_count = 0;
-            ml_cc->cwnd_bytes += acked * XQC_ML_CC_UT_CWND_GAIN;
-            action = "ut_growth";
+            /* Suppress growth if RTT is already elevated */
+            if (adjusted_rtt > XQC_ML_CC_RTT_GROWTH_SUPPRESS_US) {
+                action = "ut_rtt_hold";
+            } else {
+                ml_cc->cwnd_bytes += acked * XQC_ML_CC_UT_CWND_GAIN;
+                action = "ut_growth";
+            }
             break;
 
         case XQC_ML_CC_STATE_QU:
@@ -735,8 +740,13 @@ xqc_ml_cc_feed_features(void *cong, xqc_usec_t ack_recv_time,
              */
             if (ml_cc->state_probs[XQC_ML_CC_STATE_QU] < 0.55f) {
                 ml_cc->qu_consecutive_count = 0;
-                ml_cc->cwnd_bytes += acked * XQC_ML_CC_UT_CWND_GAIN;
-                action = "qu_low_conf_growth";
+                /* Suppress growth if RTT is already elevated */
+                if (adjusted_rtt > XQC_ML_CC_RTT_GROWTH_SUPPRESS_US) {
+                    action = "qu_low_conf_rtt_hold";
+                } else {
+                    ml_cc->cwnd_bytes += acked * XQC_ML_CC_UT_CWND_GAIN;
+                    action = "qu_low_conf_growth";
+                }
                 break;
             }
 
@@ -752,9 +762,15 @@ xqc_ml_cc_feed_features(void *cong, xqc_usec_t ack_recv_time,
                 ml_cc->qu_consecutive_count = 0;
 
                 if (ml_cc->queue_depth_ema < ml_cc->queue_threshold_k - XQC_ML_CC_QU_QUEUE_DEADZONE) {
-                    grow_strength = xqc_ml_cc_calc_qu_growth_strength(ml_cc);
-                    ml_cc->cwnd_bytes += acked * XQC_ML_CC_QU_GROWTH_BASE * grow_strength;
-                    qu_mode = "grow";
+                    /* Suppress growth if RTT is already elevated */
+                    if (adjusted_rtt > XQC_ML_CC_RTT_GROWTH_SUPPRESS_US) {
+                        ml_cc->cwnd_bytes += acked * XQC_ML_CC_QU_HOLD_GAIN;
+                        qu_mode = "grow_rtt_hold";
+                    } else {
+                        grow_strength = xqc_ml_cc_calc_qu_growth_strength(ml_cc);
+                        ml_cc->cwnd_bytes += acked * XQC_ML_CC_QU_GROWTH_BASE * grow_strength;
+                        qu_mode = "grow";
+                    }
 
                 } else if (ml_cc->queue_depth_ema > ml_cc->queue_threshold_k + XQC_ML_CC_QU_QUEUE_DEADZONE) {
                     drain_strength = xqc_ml_cc_calc_qu_drain_strength(ml_cc);
@@ -797,8 +813,13 @@ xqc_ml_cc_feed_features(void *cong, xqc_usec_t ack_recv_time,
                 ml_cc->eb_consecutive_count++;
                 action = "eb_decrease";
             } else {
-                /* Hold current cwnd to let the queue drain */
-                action = "eb_hold";
+                /* During EB hold, if RTT is still high, actively drain */
+                if (adjusted_rtt > XQC_ML_CC_RTT_DRAIN_THRESHOLD_US) {
+                    ml_cc->cwnd_bytes -= acked * 1.0f;
+                    action = "eb_rtt_drain";
+                } else {
+                    action = "eb_hold";
+                }
             }
             break;
 

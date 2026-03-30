@@ -40,6 +40,8 @@
 
 #define XQC_ML_CC_EB_THRESHOLD            0.50f
 #define XQC_ML_CC_MAX_CONSECUTIVE_EB      2
+#define XQC_ML_CC_RTT_GROWTH_SUPPRESS_US  100000
+#define XQC_ML_CC_RTT_DRAIN_THRESHOLD_US  150000
 
 typedef enum {
     XQC_ML_CC_STATE_UT = 0,
