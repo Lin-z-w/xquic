@@ -848,6 +848,7 @@ xqc_send_ctl_on_ack_received(xqc_send_ctl_t *send_ctl, xqc_pn_ctl_t *pn_ctl, xqc
     xqc_usec_t spurious_loss_sent_time = 0;
     unsigned char need_del_record = 0;
     int stream_frame_acked = 0;
+    uint64_t total_acked_bytes = 0;
 
     if (xqc_send_ctl_detect_optimistic_ack_attack(send_ctl, pn_ctl, ack_info, ack_recv_time) < 0) {
         XQC_CONN_ERR(conn, TRA_PROTOCOL_VIOLATION);
@@ -958,6 +959,8 @@ xqc_send_ctl_on_ack_received(xqc_send_ctl_t *send_ctl, xqc_pn_ctl_t *pn_ctl, xqc
                 conn->max_acked_po_size = packet_out->po_used_size + XQC_TLS_AEAD_OVERHEAD_MAX_LEN;
             }
             
+            /* accumulate total acked bytes for ml_cc */
+            total_acked_bytes += packet_out->po_used_size;
 
             xqc_send_queue_maybe_remove_unacked(packet_out, send_queue, NULL);
 
@@ -1143,7 +1146,7 @@ xqc_send_ctl_on_ack_received(xqc_send_ctl_t *send_ctl, xqc_pn_ctl_t *pn_ctl, xqc
         xqc_ml_cc_feed_features(send_ctl->ctl_cong, ack_recv_time,
             adjusted_rtt, short_loss_rate, short_lost_cnt, short_send_cnt,
             long_loss_rate, long_lost_cnt, long_send_cnt,
-            response_interval, cwnd, send_ctl->ctl_pkt_in_flight);
+            response_interval, cwnd, send_ctl->ctl_pkt_in_flight, total_acked_bytes);
     }
 
     send_ctl->ctl_last_ack_recv_time = ack_recv_time;

@@ -6,6 +6,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#include <string.h>
 #include <xquic/xquic.h>
 #include "src/common/xqc_config.h"
 #include "src/common/xqc_time.h"
@@ -304,15 +305,6 @@ xqc_ml_cc_update_window(xqc_ml_cc_t *ml_cc, float *features)
     ml_cc->sample_count++;
 }
 
-static float
-xqc_ml_cc_get_acked_bytes(xqc_packet_out_t *po)
-{
-    if (po && po->po_used_size > 0) {
-        return (float)po->po_used_size;
-    }
-    return (float)XQC_ML_CC_MSS;
-}
-
 static void
 xqc_ml_cc_clamp_cwnd(xqc_ml_cc_t *ml_cc)
 {
@@ -552,23 +544,6 @@ xqc_ml_cc_run_qu_queue_inference(xqc_ml_cc_t *ml_cc, float *queue_depth)
 }
 #endif
 
-static void
-xqc_ml_cc_apply_qu_fallback(xqc_ml_cc_t *ml_cc)
-{
-    ml_cc->qu_consecutive_count++;
-
-    if (ml_cc->qu_consecutive_count >= XQC_ML_CC_QU_CONSECUTIVE_THRESHOLD) {
-        ml_cc->cwnd_bytes *= XQC_ML_CC_QU_CWND_DECREASE;
-        ml_cc->qu_consecutive_count = 0;
-        xqc_ml_cc_clamp_cwnd(ml_cc);
-
-        xqc_log(xqc_ml_cc_get_log(ml_cc), XQC_LOG_DEBUG,
-                "|ml_cc|qu_fallback|cwnd:%u|threshold:%d|",
-                (uint32_t)ml_cc->cwnd_bytes,
-                XQC_ML_CC_QU_CONSECUTIVE_THRESHOLD);
-    }
-}
-
 static float
 xqc_ml_cc_calc_qu_growth_strength(xqc_ml_cc_t *ml_cc)
 {
@@ -604,50 +579,19 @@ xqc_ml_cc_calc_qu_drain_strength(xqc_ml_cc_t *ml_cc)
     return powf(dist_down, XQC_ML_CC_QU_GAMMA_DOWN);
 }
 
-static void
-xqc_ml_cc_apply_qu_fine_grained_control(xqc_ml_cc_t *ml_cc, xqc_packet_out_t *po)
-{
-    float acked = xqc_ml_cc_get_acked_bytes(po);
-    float grow_strength = 0.0f;
-    float drain_strength = 0.0f;
-    float cwnd_before = ml_cc->cwnd_bytes;
-    const char *mode = "hold";
-
-    ml_cc->qu_consecutive_count = 0;
-
-    if (ml_cc->queue_depth_ema < ml_cc->queue_threshold_k - XQC_ML_CC_QU_QUEUE_DEADZONE) {
-        grow_strength = xqc_ml_cc_calc_qu_growth_strength(ml_cc);
-        ml_cc->cwnd_bytes += acked * XQC_ML_CC_QU_GROWTH_BASE * grow_strength;
-        mode = "grow";
-
-    } else if (ml_cc->queue_depth_ema > ml_cc->queue_threshold_k + XQC_ML_CC_QU_QUEUE_DEADZONE) {
-        drain_strength = xqc_ml_cc_calc_qu_drain_strength(ml_cc);
-        ml_cc->cwnd_bytes -= acked * XQC_ML_CC_QU_DRAIN_BASE * drain_strength;
-        mode = "drain";
-
-    } else {
-        ml_cc->cwnd_bytes += acked * XQC_ML_CC_QU_HOLD_GAIN;
-    }
-
-    xqc_ml_cc_clamp_cwnd(ml_cc);
-
-    xqc_log(xqc_ml_cc_get_log(ml_cc), XQC_LOG_DEBUG,
-            "|ml_cc|qu_fine|mode:%s|prob_qu:%.3f|queue_raw:%.3f|queue_ema:%.3f|"
-            "queue_k:%.3f|grow:%.3f|drain:%.3f|acked:%.1f|cwnd_before:%u|cwnd_after:%u|",
-            mode, ml_cc->state_probs[XQC_ML_CC_STATE_QU], ml_cc->queue_depth_raw,
-            ml_cc->queue_depth_ema, ml_cc->queue_threshold_k, grow_strength,
-            drain_strength, acked, (uint32_t)cwnd_before, (uint32_t)ml_cc->cwnd_bytes);
-}
-
 void
 xqc_ml_cc_feed_features(void *cong, xqc_usec_t ack_recv_time,
     xqc_usec_t adjusted_rtt, double short_loss_rate, unsigned short_lost_cnt,
     unsigned short_send_cnt, double long_loss_rate, unsigned long_lost_cnt,
     unsigned long_send_cnt, xqc_usec_t response_interval, uint64_t cwnd,
-    unsigned pkt_in_fly)
+    unsigned pkt_in_fly, uint64_t total_acked_bytes)
 {
     xqc_ml_cc_t *ml_cc = (xqc_ml_cc_t *)cong;
     float features[XQC_ML_CC_NUM_FEATURES];
+    float queue_depth = 0.0f;
+    float acked = (float)total_acked_bytes;
+    float cwnd_before;
+    const char *action = "none";
 
     (void)ack_recv_time;
 
@@ -662,11 +606,52 @@ xqc_ml_cc_feed_features(void *cong, xqc_usec_t ack_recv_time,
 
     xqc_ml_cc_update_window(ml_cc, features);
 
+    /* handle frozen state first */
+    if (ml_cc->is_frozen) {
+        xqc_usec_t elapsed = ack_recv_time - ml_cc->freeze_start_time;
+        double short_loss_rate_local = 0.0;
+        xqc_send_ctl_t *ctl = ml_cc->send_ctl;
+
+        if (ctl && ctl->ctl_recent_send_count[0] > 0) {
+            short_loss_rate_local = (double)ctl->ctl_recent_lost_count[0]
+                / ctl->ctl_recent_send_count[0] * 100.0;
+        }
+
+        if (elapsed < XQC_ML_CC_NH_FREEZE_DURATION) {
+            if (short_loss_rate_local > XQC_ML_CC_NH_LOSS_HIGH) {
+                ml_cc->loss_spike_during_freeze = XQC_TRUE;
+            }
+        } else {
+            if (!ml_cc->loss_spike_during_freeze) {
+                ml_cc->is_frozen = XQC_FALSE;
+                xqc_log(xqc_ml_cc_get_log(ml_cc), XQC_LOG_DEBUG,
+                        "|ml_cc|frozen_exit|elapsed:%ui|no_loss_spike|",
+                        (uint32_t)elapsed);
+            } else if (short_loss_rate_local < XQC_ML_CC_NH_LOSS_LOW) {
+                ml_cc->is_frozen = XQC_FALSE;
+                ml_cc->loss_spike_during_freeze = XQC_FALSE;
+                xqc_log(xqc_ml_cc_get_log(ml_cc), XQC_LOG_DEBUG,
+                        "|ml_cc|frozen_exit|elapsed:%ui|loss_below_threshold|",
+                        (uint32_t)elapsed);
+            }
+        }
+
+        if (ml_cc->is_frozen) {
+            ml_cc->cwnd_bytes = ml_cc->frozen_cwnd;
+            xqc_log(xqc_ml_cc_get_log(ml_cc), XQC_LOG_DEBUG,
+                    "|ml_cc|frozen|elapsed:%ui|loss:%.2f|spike:%d|cwnd:%u|",
+                    (uint32_t)elapsed, short_loss_rate_local,
+                    ml_cc->loss_spike_during_freeze ? 1 : 0,
+                    (uint32_t)ml_cc->cwnd_bytes);
+            return;
+        }
+    }
+
     if (!ml_cc->is_frozen) {
         xqc_ml_cc_state_t prev_state = ml_cc->last_state;
         xqc_ml_cc_run_state_inference(ml_cc);
         ml_cc->last_state = xqc_ml_cc_determine_state(ml_cc);
-        xqc_log(xqc_ml_cc_get_log(ml_cc), XQC_LOG_DEBUG,
+        xqc_log(xqc_ml_cc_get_log(ml_cc), XQC_LOG_REPORT,
                 "|ml_cc|state_update|prev_state:%s|state:%s|"
                 "prob_ut:%.3f|prob_qu:%.3f|prob_eb:%.3f|prob_nh:%.3f|"
                 "adjusted_rtt:%ui|short_loss:%.2f|long_loss:%.2f|cwnd:%ui|pkt_in_fly:%ud|samples:%d|",
@@ -678,6 +663,126 @@ xqc_ml_cc_feed_features(void *cong, xqc_usec_t ack_recv_time,
                 ml_cc->state_probs[XQC_ML_CC_STATE_NH],
                 adjusted_rtt, short_loss_rate, long_loss_rate, (uint32_t)cwnd,
                 pkt_in_fly, ml_cc->sample_count);
+
+        /* run queue model inference if state is QU */
+        if (ml_cc->last_state == XQC_ML_CC_STATE_QU
+            && ml_cc->queue_model_enabled
+            && ml_cc->queue_model_ready
+            && ml_cc->state_probs[XQC_ML_CC_STATE_QU] >= XQC_ML_CC_QU_CONFIDENCE_THRESHOLD
+            && xqc_ml_cc_run_qu_queue_inference(ml_cc, &queue_depth))
+        {
+            ml_cc->queue_depth_raw = queue_depth;
+            ml_cc->queue_depth_ema = xqc_ml_cc_clamp_float(
+                (1.0f - XQC_ML_CC_QU_QUEUE_EMA_ALPHA) * ml_cc->queue_depth_ema
+                + XQC_ML_CC_QU_QUEUE_EMA_ALPHA * queue_depth,
+                0.0f, 1.0f);
+            xqc_log(xqc_ml_cc_get_log(ml_cc), XQC_LOG_REPORT,
+                    "|ml_cc|queue_update|state:%s|prob_qu:%.3f|queue_raw:%.3f|"
+                    "queue_ema:%.3f|queue_k:%.3f|",
+                    xqc_ml_cc_state_to_str(ml_cc->last_state),
+                    ml_cc->state_probs[XQC_ML_CC_STATE_QU],
+                    ml_cc->queue_depth_raw,
+                    ml_cc->queue_depth_ema, ml_cc->queue_threshold_k);
+        }
+
+        /* apply window adjustment once per ACK based on state */
+        cwnd_before = ml_cc->cwnd_bytes;
+
+        switch (ml_cc->last_state) {
+        case XQC_ML_CC_STATE_NH:
+            ml_cc->frozen_cwnd = ml_cc->cwnd_bytes * XQC_ML_CC_NH_FREEZE_CWND_FACTOR;
+            ml_cc->cwnd_bytes = ml_cc->frozen_cwnd;
+            ml_cc->is_frozen = XQC_TRUE;
+            ml_cc->freeze_start_time = ack_recv_time;
+            ml_cc->loss_spike_during_freeze = XQC_FALSE;
+            ml_cc->eb_consecutive_count = 0;
+            action = "nh_freeze";
+            break;
+
+        case XQC_ML_CC_STATE_UT:
+            ml_cc->qu_consecutive_count = 0;
+            ml_cc->eb_consecutive_count = 0;
+            ml_cc->cwnd_bytes += acked * XQC_ML_CC_UT_CWND_GAIN;
+            action = "ut_growth";
+            break;
+
+        case XQC_ML_CC_STATE_QU:
+            ml_cc->eb_consecutive_count = 0;
+
+            if (ml_cc->queue_model_enabled
+                && ml_cc->queue_model_ready
+                && ml_cc->state_probs[XQC_ML_CC_STATE_QU] >= XQC_ML_CC_QU_CONFIDENCE_THRESHOLD)
+            {
+                /* apply fine-grained queue control */
+                float grow_strength = 0.0f;
+                float drain_strength = 0.0f;
+                const char *qu_mode = "hold";
+
+                ml_cc->qu_consecutive_count = 0;
+
+                if (ml_cc->queue_depth_ema < ml_cc->queue_threshold_k - XQC_ML_CC_QU_QUEUE_DEADZONE) {
+                    grow_strength = xqc_ml_cc_calc_qu_growth_strength(ml_cc);
+                    ml_cc->cwnd_bytes += acked * XQC_ML_CC_QU_GROWTH_BASE * grow_strength;
+                    qu_mode = "grow";
+
+                } else if (ml_cc->queue_depth_ema > ml_cc->queue_threshold_k + XQC_ML_CC_QU_QUEUE_DEADZONE) {
+                    drain_strength = xqc_ml_cc_calc_qu_drain_strength(ml_cc);
+                    ml_cc->cwnd_bytes -= acked * XQC_ML_CC_QU_DRAIN_BASE * drain_strength;
+                    qu_mode = "drain";
+
+                } else {
+                    ml_cc->cwnd_bytes += acked * XQC_ML_CC_QU_HOLD_GAIN;
+                }
+
+                xqc_log(xqc_ml_cc_get_log(ml_cc), XQC_LOG_DEBUG,
+                        "|ml_cc|qu_fine|mode:%s|prob_qu:%.3f|queue_raw:%.3f|queue_ema:%.3f|"
+                        "queue_k:%.3f|grow:%.3f|drain:%.3f|acked:%.1f|",
+                        qu_mode, ml_cc->state_probs[XQC_ML_CC_STATE_QU], ml_cc->queue_depth_raw,
+                        ml_cc->queue_depth_ema, ml_cc->queue_threshold_k, grow_strength,
+                        drain_strength, acked);
+                action = "qu_fine";
+            } else {
+                /* fallback: consecutive count based */
+                ml_cc->qu_consecutive_count++;
+                if (ml_cc->qu_consecutive_count >= XQC_ML_CC_QU_CONSECUTIVE_THRESHOLD) {
+                    ml_cc->cwnd_bytes *= XQC_ML_CC_QU_CWND_DECREASE;
+                    ml_cc->qu_consecutive_count = 0;
+                    action = "qu_fallback_decrease";
+                } else {
+                    action = "qu_fallback_wait";
+                }
+            }
+            break;
+
+        case XQC_ML_CC_STATE_EB:
+            ml_cc->qu_consecutive_count = 0;
+
+            /*
+             * Limit consecutive EB window reductions to prevent
+             * excessive cwnd drop and pipeline starvation.
+             */
+            if (ml_cc->eb_consecutive_count < XQC_ML_CC_MAX_CONSECUTIVE_EB) {
+                ml_cc->cwnd_bytes *= XQC_ML_CC_EB_CWND_DECREASE;
+                ml_cc->eb_consecutive_count++;
+                action = "eb_decrease";
+            } else {
+                /* Hold current cwnd to avoid starvation */
+                action = "eb_hold";
+            }
+            break;
+
+        default:
+            break;
+        }
+
+        xqc_ml_cc_clamp_cwnd(ml_cc);
+
+        if (strcmp(action, "none") != 0) {
+            xqc_log(xqc_ml_cc_get_log(ml_cc), XQC_LOG_DEBUG,
+                    "|ml_cc|cwnd_adjust|action:%s|state:%s|acked:%.1f|cwnd_before:%u|cwnd_after:%u|",
+                    action, xqc_ml_cc_state_to_str(ml_cc->last_state), acked,
+                    (uint32_t)cwnd_before, (uint32_t)ml_cc->cwnd_bytes);
+        }
     }
 
     ml_cc->last_rtt = adjusted_rtt;
@@ -727,6 +832,7 @@ xqc_ml_cc_init(void *cong, xqc_send_ctl_t *ctl_ctx, xqc_cc_params_t cc_params)
     ml_cc->queue_model_enabled = 1;
     ml_cc->queue_model_ready = 0;
     ml_cc->state_model_ready = 0;
+    ml_cc->eb_consecutive_count = 0;
 
     memset(ml_cc->history_window, 0, sizeof(ml_cc->history_window));
     memset(ml_cc->state_probs, 0, sizeof(ml_cc->state_probs));
@@ -780,112 +886,14 @@ xqc_ml_cc_init(void *cong, xqc_send_ctl_t *ctl_ctx, xqc_cc_params_t cc_params)
 static void
 xqc_ml_cc_on_ack(void *cong, xqc_packet_out_t *po, xqc_usec_t now)
 {
-    xqc_ml_cc_t *ml_cc = (xqc_ml_cc_t *)cong;
-
-    if (ml_cc->is_frozen) {
-        xqc_usec_t elapsed = now - ml_cc->freeze_start_time;
-        double short_loss_rate = 0.0;
-        xqc_send_ctl_t *ctl = ml_cc->send_ctl;
-
-        if (ctl && ctl->ctl_recent_send_count[0] > 0) {
-            short_loss_rate = (double)ctl->ctl_recent_lost_count[0]
-                / ctl->ctl_recent_send_count[0] * 100.0;
-        }
-
-        if (elapsed < XQC_ML_CC_NH_FREEZE_DURATION) {
-            if (short_loss_rate > XQC_ML_CC_NH_LOSS_HIGH) {
-                ml_cc->loss_spike_during_freeze = XQC_TRUE;
-            }
-        } else {
-            if (!ml_cc->loss_spike_during_freeze) {
-                ml_cc->is_frozen = XQC_FALSE;
-                xqc_log(xqc_ml_cc_get_log(ml_cc), XQC_LOG_DEBUG,
-                        "|ml_cc|frozen_exit|elapsed:%ui|no_loss_spike|",
-                        (uint32_t)elapsed);
-            } else if (short_loss_rate < XQC_ML_CC_NH_LOSS_LOW) {
-                ml_cc->is_frozen = XQC_FALSE;
-                ml_cc->loss_spike_during_freeze = XQC_FALSE;
-                xqc_log(xqc_ml_cc_get_log(ml_cc), XQC_LOG_DEBUG,
-                        "|ml_cc|frozen_exit|elapsed:%ui|loss_below_threshold|",
-                        (uint32_t)elapsed);
-            }
-        }
-
-        if (ml_cc->is_frozen) {
-            ml_cc->cwnd_bytes = ml_cc->frozen_cwnd;
-            xqc_log(xqc_ml_cc_get_log(ml_cc), XQC_LOG_DEBUG,
-                    "|ml_cc|frozen|elapsed:%ui|loss:%.2f|spike:%d|cwnd:%u|",
-                    (uint32_t)elapsed, short_loss_rate,
-                    ml_cc->loss_spike_during_freeze ? 1 : 0,
-                    (uint32_t)ml_cc->cwnd_bytes);
-            return;
-        }
-    }
-
-    if (ml_cc->last_state == XQC_ML_CC_STATE_NH) {
-        ml_cc->frozen_cwnd = ml_cc->cwnd_bytes * XQC_ML_CC_NH_FREEZE_CWND_FACTOR;
-        ml_cc->cwnd_bytes = ml_cc->frozen_cwnd;
-        ml_cc->is_frozen = XQC_TRUE;
-        ml_cc->freeze_start_time = now;
-        ml_cc->loss_spike_during_freeze = XQC_FALSE;
-
-        xqc_log(xqc_ml_cc_get_log(ml_cc), XQC_LOG_DEBUG,
-                "|ml_cc|nh_enter|frozen_cwnd:%u|prob_nh:%.3f|",
-                (uint32_t)ml_cc->frozen_cwnd, ml_cc->state_probs[3]);
-        return;
-    }
-
-    if (ml_cc->last_state == XQC_ML_CC_STATE_UT) {
-        float acked = xqc_ml_cc_get_acked_bytes(po);
-        ml_cc->qu_consecutive_count = 0;
-        ml_cc->cwnd_bytes += acked * XQC_ML_CC_UT_CWND_GAIN;
-        xqc_ml_cc_clamp_cwnd(ml_cc);
-
-        xqc_log(xqc_ml_cc_get_log(ml_cc), XQC_LOG_DEBUG,
-                "|ml_cc|ut_state|gain:%.2f|acked:%.1f|cwnd:%u|",
-                XQC_ML_CC_UT_CWND_GAIN, acked, (uint32_t)ml_cc->cwnd_bytes);
-        return;
-    }
-
-    if (ml_cc->last_state == XQC_ML_CC_STATE_QU) {
-        float queue_depth = 0.0f;
-
-        if (ml_cc->queue_model_enabled
-            && ml_cc->queue_model_ready
-            && ml_cc->state_probs[XQC_ML_CC_STATE_QU] >= XQC_ML_CC_QU_CONFIDENCE_THRESHOLD
-            && xqc_ml_cc_run_qu_queue_inference(ml_cc, &queue_depth))
-        {
-            float prev_queue_ema = ml_cc->queue_depth_ema;
-            ml_cc->queue_depth_raw = queue_depth;
-            ml_cc->queue_depth_ema = xqc_ml_cc_clamp_float(
-                (1.0f - XQC_ML_CC_QU_QUEUE_EMA_ALPHA) * ml_cc->queue_depth_ema
-                + XQC_ML_CC_QU_QUEUE_EMA_ALPHA * queue_depth,
-                0.0f, 1.0f);
-            xqc_log(xqc_ml_cc_get_log(ml_cc), XQC_LOG_DEBUG,
-                    "|ml_cc|queue_update|state:%s|prob_qu:%.3f|queue_raw:%.3f|"
-                    "queue_ema_prev:%.3f|queue_ema:%.3f|queue_k:%.3f|",
-                    xqc_ml_cc_state_to_str(ml_cc->last_state),
-                    ml_cc->state_probs[XQC_ML_CC_STATE_QU],
-                    ml_cc->queue_depth_raw, prev_queue_ema,
-                    ml_cc->queue_depth_ema, ml_cc->queue_threshold_k);
-            xqc_ml_cc_apply_qu_fine_grained_control(ml_cc, po);
-        } else {
-            xqc_ml_cc_apply_qu_fallback(ml_cc);
-        }
-
-        return;
-    }
-
-    if (ml_cc->last_state == XQC_ML_CC_STATE_EB) {
-        ml_cc->qu_consecutive_count = 0;
-        ml_cc->cwnd_bytes *= XQC_ML_CC_EB_CWND_DECREASE;
-        xqc_ml_cc_clamp_cwnd(ml_cc);
-
-        xqc_log(xqc_ml_cc_get_log(ml_cc), XQC_LOG_DEBUG,
-                "|ml_cc|eb_state|decrease|cwnd:%u|",
-                (uint32_t)ml_cc->cwnd_bytes);
-        return;
-    }
+    /*
+     * Window adjustment is now handled in xqc_ml_cc_feed_features (once per ACK).
+     * This function is called for each acked packet but should not perform
+     * any window operations to avoid duplicate adjustments.
+     */
+    (void)cong;
+    (void)po;
+    (void)now;
 }
 
 static void
