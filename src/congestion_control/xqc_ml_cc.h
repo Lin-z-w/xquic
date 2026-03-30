@@ -13,7 +13,7 @@
 #define XQC_ML_CC_NUM_FEATURES            15
 #define XQC_ML_CC_MSS                     (XQC_MSS)
 #define XQC_ML_CC_INIT_WIN                (32 * XQC_ML_CC_MSS)
-#define XQC_ML_CC_MIN_CWND                (4 * XQC_ML_CC_MSS)
+#define XQC_ML_CC_MIN_CWND                (20 * XQC_ML_CC_MSS)
 
 #define XQC_ML_CC_RECOVERY_RTT            3
 
@@ -24,11 +24,11 @@
 #define XQC_ML_CC_NH_LOSS_LOW             10.0
 #define XQC_ML_CC_NH_FREEZE_CWND_FACTOR   0.7f
 
-#define XQC_ML_CC_UT_CWND_GAIN            0.3f
+#define XQC_ML_CC_UT_CWND_GAIN            1.1f
 #define XQC_ML_CC_QU_CWND_DECREASE        0.95f
-#define XQC_ML_CC_EB_CWND_DECREASE        0.5f
+#define XQC_ML_CC_EB_CWND_DECREASE        0.75f
 
-#define XQC_ML_CC_QU_QUEUE_K              0.05f
+#define XQC_ML_CC_QU_QUEUE_K              0.40f
 #define XQC_ML_CC_QU_QUEUE_DEADZONE       0.05f
 #define XQC_ML_CC_QU_QUEUE_EMA_ALPHA      0.25f
 #define XQC_ML_CC_QU_GROWTH_BASE          1.10f
