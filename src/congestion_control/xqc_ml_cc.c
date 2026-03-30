@@ -797,11 +797,7 @@ xqc_ml_cc_feed_features(void *cong, xqc_usec_t ack_recv_time,
                 ml_cc->eb_consecutive_count++;
                 action = "eb_decrease";
             } else {
-                /*
-                 * Hold current cwnd but allow tiny growth to avoid
-                 * getting stuck in a sub-optimal plateau.
-                 */
-                ml_cc->cwnd_bytes += acked * 0.1f;
+                /* Hold current cwnd to let the queue drain */
                 action = "eb_hold";
             }
             break;
