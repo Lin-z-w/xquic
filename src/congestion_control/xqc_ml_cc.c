@@ -71,6 +71,8 @@ xqc_ml_cc_get_log(xqc_ml_cc_t *ml_cc)
 }
 
 #ifdef XQC_ENABLE_ONNX
+static OrtEnv *xqc_ml_cc_shared_ort_env = NULL;
+
 static void
 xqc_ml_cc_log_onnx_failure(xqc_ml_cc_t *ml_cc, const char *model_tag,
     const char *phase, const char *detail, const char *output_name)
@@ -118,6 +120,35 @@ xqc_ml_cc_log_ort_status(xqc_ml_cc_t *ml_cc, const OrtApi *api,
             output_name != NULL ? output_name : "null",
             ml_cc != NULL ? ml_cc->sample_count : -1, XQC_ML_CC_WINDOW_SIZE,
             msg != NULL ? msg : "unknown");
+}
+
+static OrtEnv *
+xqc_ml_cc_get_shared_env(xqc_ml_cc_t *ml_cc, const OrtApi *api,
+    const char *model_tag, const char *model_path)
+{
+    OrtStatus *status = NULL;
+
+    if (api == NULL) {
+        xqc_ml_cc_log_onnx_failure(ml_cc, model_tag, "create_env",
+            "null_onnx_api", NULL);
+        return NULL;
+    }
+
+    if (xqc_ml_cc_shared_ort_env != NULL) {
+        return xqc_ml_cc_shared_ort_env;
+    }
+
+    status = api->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "xqc_ml_cc",
+        &xqc_ml_cc_shared_ort_env);
+    if (status != NULL) {
+        xqc_ml_cc_log_ort_status(ml_cc, api, status, model_tag,
+            "create_env", NULL, model_path);
+        api->ReleaseStatus(status);
+        xqc_ml_cc_shared_ort_env = NULL;
+        return NULL;
+    }
+
+    return xqc_ml_cc_shared_ort_env;
 }
 #endif
 
@@ -332,10 +363,8 @@ xqc_ml_cc_create_session(xqc_ml_cc_t *ml_cc, const OrtApi *api,
         return NULL;
     }
 
-    status = api->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "xqc_ml_cc", &env);
-    if (status != NULL) {
-        xqc_ml_cc_log_ort_status(ml_cc, api, status, model_tag,
-            "create_env", NULL, model_path);
+    env = xqc_ml_cc_get_shared_env(ml_cc, api, model_tag, model_path);
+    if (env == NULL) {
         goto end;
     }
 
@@ -359,9 +388,6 @@ end:
     }
     if (options != NULL) {
         api->ReleaseSessionOptions(options);
-    }
-    if (env != NULL) {
-        api->ReleaseEnv(env);
     }
     return session;
 }
