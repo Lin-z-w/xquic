@@ -336,6 +336,25 @@ xqc_ml_cc_determine_state(xqc_ml_cc_t *ml_cc)
         }
     }
 
+    /*
+     * If EB wins by a tiny margin, it is likely a jitter in model output.
+     * Fall back to the second highest state to avoid excessive cwnd
+     * oscillation and RTT inflation.
+     */
+    if (max_idx == XQC_ML_CC_STATE_EB
+        && max_prob < XQC_ML_CC_EB_THRESHOLD)
+    {
+        int second_idx = 0;
+        float second_prob = ml_cc->state_probs[0];
+        for (i = 1; i < 4; i++) {
+            if (i != max_idx && ml_cc->state_probs[i] > second_prob) {
+                second_prob = ml_cc->state_probs[i];
+                second_idx = i;
+            }
+        }
+        return (xqc_ml_cc_state_t)second_idx;
+    }
+
     return (xqc_ml_cc_state_t)max_idx;
 }
 
@@ -766,7 +785,11 @@ xqc_ml_cc_feed_features(void *cong, xqc_usec_t ack_recv_time,
                 ml_cc->eb_consecutive_count++;
                 action = "eb_decrease";
             } else {
-                /* Hold current cwnd to avoid starvation */
+                /*
+                 * Hold current cwnd but allow tiny growth to avoid
+                 * getting stuck in a sub-optimal plateau.
+                 */
+                ml_cc->cwnd_bytes += acked * 0.1f;
                 action = "eb_hold";
             }
             break;

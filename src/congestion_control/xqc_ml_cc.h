@@ -24,7 +24,7 @@
 #define XQC_ML_CC_NH_LOSS_LOW             10.0
 #define XQC_ML_CC_NH_FREEZE_CWND_FACTOR   0.7f
 
-#define XQC_ML_CC_UT_CWND_GAIN            1.1f
+#define XQC_ML_CC_UT_CWND_GAIN            0.6f
 #define XQC_ML_CC_QU_CWND_DECREASE        0.95f
 #define XQC_ML_CC_EB_CWND_DECREASE        0.75f
 
@@ -38,7 +38,8 @@
 #define XQC_ML_CC_QU_GAMMA_DOWN           1.2f
 #define XQC_ML_CC_QU_CONFIDENCE_THRESHOLD 0.50f
 
-#define XQC_ML_CC_MAX_CONSECUTIVE_EB      2
+#define XQC_ML_CC_EB_THRESHOLD            0.60f
+#define XQC_ML_CC_MAX_CONSECUTIVE_EB      1
 
 typedef enum {
     XQC_ML_CC_STATE_UT = 0,
