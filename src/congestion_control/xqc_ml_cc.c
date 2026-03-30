@@ -728,6 +728,18 @@ xqc_ml_cc_feed_features(void *cong, xqc_usec_t ack_recv_time,
         case XQC_ML_CC_STATE_QU:
             ml_cc->eb_consecutive_count = 0;
 
+            /*
+             * If the model is not confident about QU, do not suppress
+             * cwnd. Treat low-confidence QU as UT to allow bandwidth
+             * probing and avoid getting stuck below the BDP.
+             */
+            if (ml_cc->state_probs[XQC_ML_CC_STATE_QU] < 0.55f) {
+                ml_cc->qu_consecutive_count = 0;
+                ml_cc->cwnd_bytes += acked * XQC_ML_CC_UT_CWND_GAIN;
+                action = "qu_low_conf_growth";
+                break;
+            }
+
             if (ml_cc->queue_model_enabled
                 && ml_cc->queue_model_ready
                 && ml_cc->state_probs[XQC_ML_CC_STATE_QU] >= XQC_ML_CC_QU_CONFIDENCE_THRESHOLD)

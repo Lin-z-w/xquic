@@ -29,16 +29,16 @@
 #define XQC_ML_CC_EB_CWND_DECREASE        0.75f
 
 #define XQC_ML_CC_QU_QUEUE_K              0.40f
-#define XQC_ML_CC_QU_QUEUE_DEADZONE       0.05f
+#define XQC_ML_CC_QU_QUEUE_DEADZONE       0.10f
 #define XQC_ML_CC_QU_QUEUE_EMA_ALPHA      0.25f
 #define XQC_ML_CC_QU_GROWTH_BASE          1.10f
-#define XQC_ML_CC_QU_DRAIN_BASE           1.30f
+#define XQC_ML_CC_QU_DRAIN_BASE           0.80f
 #define XQC_ML_CC_QU_HOLD_GAIN            0.05f
 #define XQC_ML_CC_QU_GAMMA_UP             1.5f
 #define XQC_ML_CC_QU_GAMMA_DOWN           1.2f
 #define XQC_ML_CC_QU_CONFIDENCE_THRESHOLD 0.50f
 
-#define XQC_ML_CC_EB_THRESHOLD            0.60f
+#define XQC_ML_CC_EB_THRESHOLD            0.55f
 #define XQC_ML_CC_MAX_CONSECUTIVE_EB      1
 
 typedef enum {
