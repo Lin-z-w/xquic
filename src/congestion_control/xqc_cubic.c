@@ -227,7 +227,13 @@ xqc_cubic_init(void *cong_ctl, xqc_send_ctl_t *ctl_ctx, xqc_cc_params_t cc_param
     cubic->use_ml = 0;
     memset(cubic->ml_window, 0, sizeof(cubic->ml_window));
     memset(cubic->ml_state_probs, 0, sizeof(cubic->ml_state_probs));
-    
+
+    /* Initialize NH freeze state */
+    cubic->is_frozen = XQC_FALSE;
+    cubic->freeze_start_time = 0;
+    cubic->frozen_cwnd = 0;
+    cubic->loss_spike_during_freeze = XQC_FALSE;
+
     /* Load ML model for intelligent loss discrimination if enabled */
     if (cc_params.customize_on && cc_params.cubic_use_ml) {
         cubic->use_ml = 1;
@@ -237,19 +243,61 @@ xqc_cubic_init(void *cong_ctl, xqc_send_ctl_t *ctl_ctx, xqc_cc_params_t cc_param
         ml_config.use_scaler = 1;
         ml_config.scaler_mean = xqc_ml_scaler_mean;
         ml_config.scaler_scale = xqc_ml_scaler_scale;
-        
-        cubic->ml_model = xqc_ml_model_load(&ml_config, 
+
+        cubic->ml_model = xqc_ml_model_load(&ml_config,
             ctl_ctx ? ctl_ctx->ctl_conn->log : NULL);
     }
 }
 
 
+/* Check and handle NH freeze state exit conditions */
+static void
+xqc_cubic_check_freeze_state(xqc_cubic_t *cubic, xqc_usec_t now)
+{
+    xqc_usec_t elapsed;
+    double short_loss_rate = 0.0;
+    xqc_send_ctl_t *ctl = cubic->send_ctl;
+
+    if (!cubic->is_frozen) {
+        return;
+    }
+
+    elapsed = now - cubic->freeze_start_time;
+
+    if (ctl && ctl->ctl_recent_send_count[0] > 0) {
+        short_loss_rate = (double)ctl->ctl_recent_lost_count[0]
+            / ctl->ctl_recent_send_count[0] * 100.0;
+    }
+
+    /* 100ms observation window logic */
+    if (elapsed < XQC_CUBIC_ML_NH_FREEZE_DURATION) {
+        if (short_loss_rate > XQC_CUBIC_ML_NH_LOSS_HIGH) {
+            cubic->loss_spike_during_freeze = XQC_TRUE;
+        }
+    } else {
+        if (!cubic->loss_spike_during_freeze) {
+            /* elapsed >= 100ms and no loss spike - exit freeze */
+            cubic->is_frozen = XQC_FALSE;
+            xqc_log(cubic->send_ctl ? cubic->send_ctl->ctl_conn->log : NULL,
+                    XQC_LOG_DEBUG,
+                    "|cubic|freeze_exit|elapsed:%ui|no_loss_spike|",
+                    (uint32_t)elapsed);
+        } else if (short_loss_rate < XQC_CUBIC_ML_NH_LOSS_LOW) {
+            /* loss spike was true but now below threshold - exit freeze */
+            cubic->is_frozen = XQC_FALSE;
+            cubic->loss_spike_during_freeze = XQC_FALSE;
+            xqc_log(cubic->send_ctl ? cubic->send_ctl->ctl_conn->log : NULL,
+                    XQC_LOG_DEBUG,
+                    "|cubic|freeze_exit|elapsed:%ui|loss_below_threshold|",
+                    (uint32_t)elapsed);
+        }
+    }
+}
+
 static void
 xqc_cubic_on_lost(void *cong_ctl, xqc_usec_t lost_sent_time)
 {
     xqc_cubic_t *cubic = (xqc_cubic_t*)(cong_ctl);
-    xqc_ml_state_t ml_state;
-    int should_decrease = 1;
 
     cubic->tcp_cwnd_cnt = 0;
 
@@ -257,9 +305,17 @@ xqc_cubic_on_lost(void *cong_ctl, xqc_usec_t lost_sent_time)
         return;
     }
 
-    /* ML-assisted loss discrimination */
+    /* In NH freeze state: don't call model, don't change cwnd on loss */
+    if (cubic->use_ml && cubic->is_frozen) {
+        return;
+    }
+
+    /* ML-assisted loss discrimination:
+     * Only decrease when state is EB (Exceeded Bandwidth)
+     * UT/QU/NH states: don't reduce on loss
+     */
     if (cubic->use_ml && cubic->ml_model != NULL) {
-        ml_state = xqc_cubic_run_ml_inference(cubic);
+        xqc_ml_state_t ml_state = xqc_cubic_run_ml_inference(cubic);
 
         xqc_log(cubic->send_ctl ? cubic->send_ctl->ctl_conn->log : NULL,
                 XQC_LOG_REPORT,
@@ -271,16 +327,12 @@ xqc_cubic_on_lost(void *cong_ctl, xqc_usec_t lost_sent_time)
                 cubic->ml_state_probs[3],
                 (uint32_t)cubic->cwnd,
                 cubic->ml_sample_count,
-                (ml_state == XQC_ML_STATE_UT) ? "skip_decrease" : "decrease");
+                (ml_state == XQC_ML_STATE_EB) ? "decrease" : "skip_decrease");
 
-        /* Only decrease for congestion states (QU, EB, NH) */
-        if (ml_state == XQC_ML_STATE_UT) {
-            should_decrease = 0;  /* Transient loss, don't reduce */
+        /* Only decrease for EB state */
+        if (ml_state != XQC_ML_STATE_EB) {
+            return;
         }
-    }
-
-    if (!should_decrease) {
-        return;
     }
 
     cubic->congestion_recovery_start_time = xqc_monotonic_timestamp();
@@ -306,9 +358,21 @@ xqc_cubic_on_ack(void *cong_ctl, xqc_packet_out_t *po, xqc_usec_t now)
     xqc_usec_t  sent_time = po->po_sent_time;
     uint32_t    acked_bytes = po->po_used_size;
     xqc_usec_t  rtt = now - sent_time;
-    
-    /* Collect ML features on each ACK if ML is enabled */
+
+    /* ML-assisted Cubic logic */
     if (cubic->use_ml && cubic->send_ctl != NULL) {
+        /* Check freeze state exit conditions first */
+        xqc_cubic_check_freeze_state(cubic, now);
+
+        /* If frozen, don't call model, keep cwnd unchanged */
+        if (cubic->is_frozen) {
+            cubic->cwnd = cubic->frozen_cwnd;
+            xqc_log(cubic->send_ctl->ctl_conn->log, XQC_LOG_DEBUG,
+                    "|cubic|frozen|cwnd:%ui|", (uint32_t)cubic->cwnd);
+            return;
+        }
+
+        /* Not frozen: collect features and run inference */
         float features[XQC_ML_NUM_FEATURES];
         xqc_send_ctl_t *ctl = cubic->send_ctl;
         double short_loss_rate = 0.0;
@@ -317,7 +381,7 @@ xqc_cubic_on_ack(void *cong_ctl, xqc_packet_out_t *po, xqc_usec_t now)
         unsigned short_send_cnt = 0;
         unsigned long_lost_cnt = 0;
         unsigned long_send_cnt = 0;
-        
+
         if (ctl->ctl_recent_send_count[0] > 0) {
             short_lost_cnt = ctl->ctl_recent_lost_count[0];
             short_send_cnt = ctl->ctl_recent_send_count[0];
@@ -328,7 +392,7 @@ xqc_cubic_on_ack(void *cong_ctl, xqc_packet_out_t *po, xqc_usec_t now)
             long_send_cnt = ctl->ctl_recent_send_count[0] + ctl->ctl_recent_send_count[1];
             long_loss_rate = (double)long_lost_cnt / long_send_cnt * 100.0;
         }
-        
+
         xqc_cubic_build_ml_features(cubic, features,
             rtt,
             short_loss_rate,
@@ -341,9 +405,30 @@ xqc_cubic_on_ack(void *cong_ctl, xqc_packet_out_t *po, xqc_usec_t now)
             cubic->cwnd,
             ctl->ctl_bytes_in_flight / XQC_MSS
         );
-        
+
         xqc_cubic_update_ml_window(cubic, features);
         cubic->ml_last_rtt = rtt;
+
+        /* Check for NH state and enter freeze if needed */
+        if (cubic->ml_model != NULL && cubic->ml_sample_count >= XQC_ML_WINDOW_SIZE) {
+            xqc_ml_state_t ml_state = xqc_cubic_run_ml_inference(cubic);
+
+            /* Enter NH freeze state if prob[NH] > 0.3 */
+            if (cubic->ml_state_probs[XQC_ML_STATE_NH] > XQC_CUBIC_ML_NH_THRESHOLD) {
+                cubic->frozen_cwnd = cubic->cwnd * XQC_CUBIC_ML_NH_FREEZE_CWND_FACTOR;
+                cubic->cwnd = cubic->frozen_cwnd;
+                cubic->is_frozen = XQC_TRUE;
+                cubic->freeze_start_time = now;
+                cubic->loss_spike_during_freeze = XQC_FALSE;
+
+                xqc_log(cubic->send_ctl->ctl_conn->log, XQC_LOG_REPORT,
+                        "|cubic|freeze_enter|prob_nh:%.3f|cwnd:%ui|frozen_cwnd:%ui|",
+                        cubic->ml_state_probs[XQC_ML_STATE_NH],
+                        (uint32_t)(cubic->cwnd / XQC_CUBIC_ML_NH_FREEZE_CWND_FACTOR),
+                        (uint32_t)cubic->frozen_cwnd);
+                return;
+            }
+        }
     }
 
     if (cubic->min_rtt == 0 || rtt < cubic->min_rtt) {

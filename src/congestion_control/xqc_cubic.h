@@ -11,6 +11,13 @@
 #include "src/transport/xqc_packet_out.h"
 #include "src/congestion_control/xqc_ml_model.h"
 
+/* Cubic-ML configuration */
+#define XQC_CUBIC_ML_NH_THRESHOLD           0.3f
+#define XQC_CUBIC_ML_NH_FREEZE_DURATION     100000  /* 100ms in us */
+#define XQC_CUBIC_ML_NH_LOSS_HIGH           50.0
+#define XQC_CUBIC_ML_NH_LOSS_LOW            10.0
+#define XQC_CUBIC_ML_NH_FREEZE_CWND_FACTOR  0.7f
+
 typedef struct {
     uint32_t        min_cwnd;
     uint64_t        init_cwnd;          /* initial window size in MSS */
@@ -34,7 +41,13 @@ typedef struct {
     float                   ml_state_probs[XQC_ML_NUM_STATES];
     xqc_usec_t              ml_last_rtt;
     uint8_t                 use_ml;     /* enable ML-assisted loss discrimination */
-    
+
+    /* NH freeze state */
+    xqc_bool_t              is_frozen;
+    xqc_usec_t              freeze_start_time;
+    uint64_t                frozen_cwnd;
+    xqc_bool_t              loss_spike_during_freeze;
+
 } xqc_cubic_t;
 
 extern const xqc_cong_ctrl_callback_t xqc_cubic_cb;
