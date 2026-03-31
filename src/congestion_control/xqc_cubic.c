@@ -311,11 +311,12 @@ xqc_cubic_on_lost(void *cong_ctl, xqc_usec_t lost_sent_time)
     }
 
     /* ML-assisted loss discrimination:
-     * Only decrease when state is EB (Exceeded Bandwidth)
-     * UT/QU/NH states: don't reduce on loss
+     * Decrease cwnd when state is QU (Queue) or EB (Exceeded Bandwidth)
+     * UT/NH states: don't reduce on loss
      */
     if (cubic->use_ml && cubic->ml_model != NULL) {
         xqc_ml_state_t ml_state = xqc_cubic_run_ml_inference(cubic);
+        int should_decrease = (ml_state == XQC_ML_STATE_QU || ml_state == XQC_ML_STATE_EB);
 
         xqc_log(cubic->send_ctl ? cubic->send_ctl->ctl_conn->log : NULL,
                 XQC_LOG_REPORT,
@@ -327,10 +328,10 @@ xqc_cubic_on_lost(void *cong_ctl, xqc_usec_t lost_sent_time)
                 cubic->ml_state_probs[3],
                 (uint32_t)cubic->cwnd,
                 cubic->ml_sample_count,
-                (ml_state == XQC_ML_STATE_EB) ? "decrease" : "skip_decrease");
+                should_decrease ? "decrease" : "skip_decrease");
 
-        /* Only decrease for EB state */
-        if (ml_state != XQC_ML_STATE_EB) {
+        /* Decrease for QU or EB state */
+        if (!should_decrease) {
             return;
         }
     }
