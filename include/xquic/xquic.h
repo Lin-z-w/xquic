@@ -905,6 +905,8 @@ typedef struct xqc_cc_params_s {
      * when Copa competes with loss-based CCAs.
      */
     double      copa_delta_ai_unit;
+    /** enable ML-assisted loss discrimination for CUBIC */
+    uint8_t     cubic_use_ml;
 } xqc_cc_params_t;
 
 /**

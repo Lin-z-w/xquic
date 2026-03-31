@@ -384,6 +384,7 @@ if(XQC_ENABLE_ML_CC)
         CONGESTION_CONTROL_SOURCES
         ${CONGESTION_CONTROL_SOURCES}
         "src/congestion_control/xqc_ml_cc.c"
+        "src/congestion_control/xqc_ml_model.c"
     )
 
     if(NOT ONNX_MODEL_DIR)

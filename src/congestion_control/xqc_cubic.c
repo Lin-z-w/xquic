@@ -2,11 +2,109 @@
  * @copyright Copyright (c) 2022, Alibaba Group Holding Limited
  * 
  * CUBIC based on https://tools.ietf.org/html/rfc8312
+ * Enhanced with ML-based loss discrimination (Cubic-ML)
  */
 
 #include "src/congestion_control/xqc_cubic.h"
 #include "src/common/xqc_config.h"
+#include "src/common/xqc_time.h"
+#include "src/congestion_control/xqc_ml_model.h"
 #include <math.h>
+#include <string.h>
+
+/* ML feature extraction helpers */
+static float
+xqc_cubic_clamp_float(float value, float min_value, float max_value)
+{
+    if (value < min_value) return min_value;
+    if (value > max_value) return max_value;
+    return value;
+}
+
+static void
+xqc_cubic_build_ml_features(xqc_cubic_t *cubic, float *features,
+    xqc_usec_t adjusted_rtt, double short_loss_rate, unsigned short_lost_cnt,
+    unsigned short_send_cnt, double long_loss_rate, unsigned long_lost_cnt,
+    unsigned long_send_cnt, xqc_usec_t response_interval, uint64_t cwnd,
+    unsigned pkt_in_fly)
+{
+    float prev_rtt = 0.0f;
+    float prev_cwnd = 0.0f;
+    float eps = 1e-8f;
+    int prev_idx;
+
+    if (cubic->ml_sample_count > 0) {
+        prev_idx = (cubic->ml_window_idx - 1 + XQC_ML_WINDOW_SIZE) % XQC_ML_WINDOW_SIZE;
+        prev_rtt = cubic->ml_window[prev_idx][0];
+        prev_cwnd = cubic->ml_window[prev_idx][8];
+    }
+
+    features[0] = (float)adjusted_rtt;
+    features[1] = (float)short_loss_rate;
+    features[2] = (float)short_lost_cnt;
+    features[3] = (float)short_send_cnt;
+    features[4] = (float)long_loss_rate;
+    features[5] = (float)long_lost_cnt;
+    features[6] = (float)long_send_cnt;
+    features[7] = (float)response_interval;
+    features[8] = (float)cwnd;
+    features[9] = (float)pkt_in_fly;
+    features[10] = features[0] - prev_rtt;
+    features[11] = features[8] / (prev_cwnd + eps);
+    features[11] = xqc_cubic_clamp_float(features[11], 0.1f, 10.0f);
+    features[12] = features[9] / (features[8] + eps);
+    features[12] = xqc_cubic_clamp_float(features[12], 0.0f, 2.0f);
+    features[13] = features[3] / (features[7] / 1000.0f + eps);
+    features[13] = xqc_cubic_clamp_float(features[13], 0.0f, 10000.0f);
+    features[14] = features[1] - features[4];
+    features[14] = xqc_cubic_clamp_float(features[14], -100.0f, 100.0f);
+}
+
+static void
+xqc_cubic_update_ml_window(xqc_cubic_t *cubic, float *features)
+{
+    int i;
+    float *row = cubic->ml_window[cubic->ml_window_idx];
+    for (i = 0; i < XQC_ML_NUM_FEATURES; i++) {
+        row[i] = features[i];
+    }
+    cubic->ml_window_idx = (cubic->ml_window_idx + 1) % XQC_ML_WINDOW_SIZE;
+    cubic->ml_sample_count++;
+}
+
+/* Run ML inference using the modular interface */
+static xqc_ml_state_t
+xqc_cubic_run_ml_inference(xqc_cubic_t *cubic)
+{
+    xqc_ml_output_t output;
+    xqc_int_t ret;
+    int start_idx, t;
+    float window[XQC_ML_WINDOW_SIZE][XQC_ML_NUM_FEATURES];
+
+    if (cubic->ml_sample_count < XQC_ML_WINDOW_SIZE || cubic->ml_model == NULL) {
+        /* Not enough samples or model not ready - use default */
+        return XQC_ML_STATE_UT;
+    }
+
+    /* Reorder window to chronological order for inference */
+    start_idx = (cubic->ml_window_idx - XQC_ML_WINDOW_SIZE + XQC_ML_WINDOW_SIZE) % XQC_ML_WINDOW_SIZE;
+    for (t = 0; t < XQC_ML_WINDOW_SIZE; t++) {
+        int src_idx = (start_idx + t) % XQC_ML_WINDOW_SIZE;
+        memcpy(window[t], cubic->ml_window[src_idx], sizeof(float) * XQC_ML_NUM_FEATURES);
+    }
+
+    ret = xqc_ml_model_infer(cubic->ml_model, window, &output, 
+                             cubic->send_ctl ? cubic->send_ctl->ctl_conn->log : NULL);
+    
+    if (ret != XQC_OK || !output.valid) {
+        return XQC_ML_STATE_UT;  /* Fallback to conservative behavior */
+    }
+
+    /* Copy probabilities for debugging */
+    memcpy(cubic->ml_state_probs, output.state_probs, sizeof(cubic->ml_state_probs));
+
+    return output.predicted_state;
+}
 
 #define XQC_CUBIC_FAST_CONVERGENCE  1
 #define XQC_CUBIC_MSS               XQC_MSS
@@ -29,71 +127,47 @@ const static uint64_t xqc_cube_factor =
  * Compute congestion window to use.
  * W_cubic(t) = C*(t-K)^3 + W_max (Eq. 1)
  * K = cubic_root(W_max*(1-beta_cubic)/C) (Eq. 2)
- * t: the time difference between the current time and the last window reduction
- * K: the time period for the function to grow from W to Wmax
- * C: window growth factor
- * beta: window reduction factor
  */
 static void
 xqc_cubic_update(void *cong_ctl, uint32_t acked_bytes, xqc_usec_t now)
 {
     xqc_cubic_t    *cubic = (xqc_cubic_t *)(cong_ctl);
-    uint64_t        t;      /* unit: ms */
-    uint64_t        offs;   /* offs = |t - K| */
-    uint64_t        delta, bic_target;  /* delta = C*(t-K)^3 */
+    uint64_t        t;
+    uint64_t        offs;
+    uint64_t        delta, bic_target;
 
     /* First ACK after a loss event. */
     if (cubic->epoch_start == 0) {
         cubic->epoch_start = now;
 
-        /* take max(last_max_cwnd, cwnd) as current Wmax origin point */
         if (cubic->cwnd >= cubic->last_max_cwnd) {
-            /* exceed origin point, use cwnd as the new point */
             cubic->bic_K = 0;
             cubic->bic_origin_point = cubic->cwnd;
-
         } else {
-            /*
-             * K = cubic_root(W_max*(1-beta_cubic)/C) = cubic_root((W_max-cwnd)/C)
-             * cube_factor = (1ull << XQC_CUBE_SCALE) / XQC_CUBIC_C / XQC_MSS
-             *             = 2^40 / (410 * MSS) = 2^30 / (410/1024*MSS)
-             *             = 2^30 / (C*MSS)
-             */
             cubic->bic_K = cbrt(xqc_cube_factor * (cubic->last_max_cwnd - cubic->cwnd));
             cubic->bic_origin_point = cubic->last_max_cwnd;
         }
     }
 
-    /*
-     * t = elapsed_time * 1024 / 1000000, convert microseconds to milliseconds,
-     * multiply by 1024 in order to be able to use bit operations later.
-     */
     t = (now + cubic->min_rtt - cubic->epoch_start) << XQC_CUBIC_TIME_SCALE;
     t /= XQC_MICROS_PER_SECOND;
 
-    /* calculate |t - K| */
     if (t < cubic->bic_K) {
         offs = cubic->bic_K - t;
-
     } else {
         offs = t - cubic->bic_K;
     }
 
-    /* 410/1024 * off/1024 * off/1024 * off/1024 * MSS */
     delta = (XQC_CUBIC_C * offs * offs * offs) >> XQC_CUBE_SCALE;
     delta *= XQC_CUBIC_MSS;
 
     if (t < cubic->bic_K) {
         bic_target = cubic->bic_origin_point - delta;
-
     } else {
         bic_target = cubic->bic_origin_point + delta;
     }
 
-    /* the maximum growth rate of CUBIC is 1.5x per RTT, i.e. 1 window every 2 ack. */
     bic_target = xqc_min(bic_target, cubic->cwnd + acked_bytes / 2);
-
-    /* take the maximum of the cwnd of TCP reno and the cwnd of cubic */
     bic_target = xqc_max(cubic->tcp_cwnd, bic_target);
 
     if (bic_target == 0) {
@@ -103,7 +177,6 @@ xqc_cubic_update(void *cong_ctl, uint32_t acked_bytes, xqc_usec_t now)
     cubic->cwnd = bic_target;
 }
 
-/* https://datatracker.ietf.org/doc/html/rfc9002#appendix-B.5 */
 static int
 xqc_cubic_in_congestion_recovery(void *cong_ctl, xqc_usec_t sent_time)
 {
@@ -121,6 +194,7 @@ static void
 xqc_cubic_init(void *cong_ctl, xqc_send_ctl_t *ctl_ctx, xqc_cc_params_t cc_params)
 {
     xqc_cubic_t *cubic = (xqc_cubic_t *)(cong_ctl);
+    xqc_ml_model_config_t ml_config;
 
     cubic->init_cwnd = XQC_CUBIC_INIT_WIN;
     cubic->min_cwnd = XQC_CUBIC_MIN_WIN;
@@ -143,6 +217,30 @@ xqc_cubic_init(void *cong_ctl, xqc_send_ctl_t *ctl_ctx, xqc_cc_params_t cc_param
     cubic->last_max_cwnd = cubic->init_cwnd;
     cubic->ssthresh = XQC_CUBIC_MAX_SSTHRESH;
     cubic->congestion_recovery_start_time = 0;
+    
+    /* Initialize ML fields */
+    cubic->send_ctl = ctl_ctx;
+    cubic->ml_window_idx = 0;
+    cubic->ml_sample_count = 0;
+    cubic->ml_last_rtt = 0;
+    cubic->ml_model = NULL;
+    cubic->use_ml = 0;
+    memset(cubic->ml_window, 0, sizeof(cubic->ml_window));
+    memset(cubic->ml_state_probs, 0, sizeof(cubic->ml_state_probs));
+    
+    /* Load ML model for intelligent loss discrimination if enabled */
+    if (cc_params.customize_on && cc_params.cubic_use_ml) {
+        cubic->use_ml = 1;
+        memset(&ml_config, 0, sizeof(ml_config));
+        ml_config.model_path = XQC_ONNX_MODEL_PATH;
+        ml_config.type = XQC_ML_MODEL_STATE;
+        ml_config.use_scaler = 1;
+        ml_config.scaler_mean = xqc_ml_scaler_mean;
+        ml_config.scaler_scale = xqc_ml_scaler_scale;
+        
+        cubic->ml_model = xqc_ml_model_load(&ml_config, 
+            ctl_ctx ? ctl_ctx->ctl_conn->log : NULL);
+    }
 }
 
 
@@ -150,27 +248,50 @@ static void
 xqc_cubic_on_lost(void *cong_ctl, xqc_usec_t lost_sent_time)
 {
     xqc_cubic_t *cubic = (xqc_cubic_t*)(cong_ctl);
+    xqc_ml_state_t ml_state;
+    int should_decrease = 1;
 
     cubic->tcp_cwnd_cnt = 0;
 
-    /* No reaction if already in a recovery period. */
     if (xqc_cubic_in_congestion_recovery(cong_ctl, lost_sent_time)) {
+        return;
+    }
+
+    /* ML-assisted loss discrimination */
+    if (cubic->use_ml && cubic->ml_model != NULL) {
+        ml_state = xqc_cubic_run_ml_inference(cubic);
+
+        xqc_log(cubic->send_ctl ? cubic->send_ctl->ctl_conn->log : NULL,
+                XQC_LOG_REPORT,
+                "|cubic|state_update|state:%s|prob_ut:%.3f|prob_qu:%.3f|prob_eb:%.3f|prob_nh:%.3f|cwnd:%ui|samples:%d|action:%s|",
+                xqc_ml_state_to_str(ml_state),
+                cubic->ml_state_probs[0],
+                cubic->ml_state_probs[1],
+                cubic->ml_state_probs[2],
+                cubic->ml_state_probs[3],
+                (uint32_t)cubic->cwnd,
+                cubic->ml_sample_count,
+                (ml_state == XQC_ML_STATE_UT) ? "skip_decrease" : "decrease");
+
+        /* Only decrease for congestion states (QU, EB, NH) */
+        if (ml_state == XQC_ML_STATE_UT) {
+            should_decrease = 0;  /* Transient loss, don't reduce */
+        }
+    }
+
+    if (!should_decrease) {
         return;
     }
 
     cubic->congestion_recovery_start_time = xqc_monotonic_timestamp();
     cubic->epoch_start = 0;
 
-    /* should we make room for others */
     if (XQC_CUBIC_FAST_CONVERGENCE && cubic->cwnd < cubic->last_max_cwnd) {
-        /* (1.0f + XQC_CUBIC_BETA) / 2.0f convert to bitwise operations */
         cubic->last_max_cwnd = cubic->cwnd * (XQC_CUBIC_BETA_SCALE + XQC_CUBIC_BETA) / (2 * XQC_CUBIC_BETA_SCALE);
-
     } else {
         cubic->last_max_cwnd = cubic->cwnd;
     }
 
-    /* Multiplicative Decrease */
     cubic->cwnd = cubic->cwnd * XQC_CUBIC_BETA / XQC_CUBIC_BETA_SCALE;
     cubic->cwnd = xqc_max(cubic->cwnd, cubic->min_cwnd);
     cubic->tcp_cwnd = cubic->cwnd;
@@ -184,25 +305,59 @@ xqc_cubic_on_ack(void *cong_ctl, xqc_packet_out_t *po, xqc_usec_t now)
     xqc_cubic_t *cubic = (xqc_cubic_t *)(cong_ctl);
     xqc_usec_t  sent_time = po->po_sent_time;
     uint32_t    acked_bytes = po->po_used_size;
-
     xqc_usec_t  rtt = now - sent_time;
+    
+    /* Collect ML features on each ACK if ML is enabled */
+    if (cubic->use_ml && cubic->send_ctl != NULL) {
+        float features[XQC_ML_NUM_FEATURES];
+        xqc_send_ctl_t *ctl = cubic->send_ctl;
+        double short_loss_rate = 0.0;
+        double long_loss_rate = 0.0;
+        unsigned short_lost_cnt = 0;
+        unsigned short_send_cnt = 0;
+        unsigned long_lost_cnt = 0;
+        unsigned long_send_cnt = 0;
+        
+        if (ctl->ctl_recent_send_count[0] > 0) {
+            short_lost_cnt = ctl->ctl_recent_lost_count[0];
+            short_send_cnt = ctl->ctl_recent_send_count[0];
+            short_loss_rate = (double)short_lost_cnt / short_send_cnt * 100.0;
+        }
+        if (ctl->ctl_recent_send_count[0] + ctl->ctl_recent_send_count[1] > 0) {
+            long_lost_cnt = ctl->ctl_recent_lost_count[0] + ctl->ctl_recent_lost_count[1];
+            long_send_cnt = ctl->ctl_recent_send_count[0] + ctl->ctl_recent_send_count[1];
+            long_loss_rate = (double)long_lost_cnt / long_send_cnt * 100.0;
+        }
+        
+        xqc_cubic_build_ml_features(cubic, features,
+            rtt,
+            short_loss_rate,
+            short_lost_cnt,
+            short_send_cnt,
+            long_loss_rate,
+            long_lost_cnt,
+            long_send_cnt,
+            0,  /* response_interval - simplified */
+            cubic->cwnd,
+            ctl->ctl_bytes_in_flight / XQC_MSS
+        );
+        
+        xqc_cubic_update_ml_window(cubic, features);
+        cubic->ml_last_rtt = rtt;
+    }
 
     if (cubic->min_rtt == 0 || rtt < cubic->min_rtt) {
         cubic->min_rtt = rtt;
     }
 
-    /* Do not increase congestion window in recovery period. */
     if (xqc_cubic_in_congestion_recovery(cong_ctl, po->po_sent_time)) {
         return;
     }
 
     if (cubic->cwnd < cubic->ssthresh) {
-        /* slow start */
         cubic->tcp_cwnd += acked_bytes;
         cubic->cwnd += acked_bytes;
-
     } else {
-        /* congestion avoidance */
         cubic->tcp_cwnd_cnt += acked_bytes;
         if (cubic->tcp_cwnd_cnt >= cubic->tcp_cwnd) {
             cubic->tcp_cwnd += XQC_CUBIC_MSS;

@@ -8,6 +8,7 @@
 #include <xquic/xquic.h>
 #include <xquic/xquic_typedef.h>
 #include "src/transport/xqc_send_ctl.h"
+#include "src/congestion_control/xqc_ml_model.h"
 
 #define XQC_ML_CC_WINDOW_SIZE             30
 #define XQC_ML_CC_NUM_FEATURES            15
@@ -62,15 +63,15 @@ typedef struct xqc_ml_cc_s {
     int                     window_idx;
     int                     sample_count;
 
-    void                   *onnx_session;
-    void                   *onnx_api;
-    void                   *queue_onnx_session;
+    /* ML models using modular interface */
+    xqc_ml_model_t         *state_model;
+    xqc_ml_model_t         *queue_model;
 
     int                     use_ml_prediction;
     float                   last_prediction;
 
-    xqc_usec_t             congestion_recovery_start_time;
-    xqc_usec_t             last_rtt;
+    xqc_usec_t              congestion_recovery_start_time;
+    xqc_usec_t              last_rtt;
     float                   loss_reduction_factor;
 
     xqc_ml_cc_state_t       last_state;
@@ -103,7 +104,5 @@ void xqc_ml_cc_feed_features(void *cong, xqc_usec_t ack_recv_time,
     unsigned short_send_cnt, double long_loss_rate, unsigned long_lost_cnt,
     unsigned long_send_cnt, xqc_usec_t response_interval, uint64_t cwnd,
     unsigned pkt_in_fly, uint64_t total_acked_bytes);
-
-void xqc_ml_cc_handle_frozen_state(xqc_ml_cc_t *ml_cc, xqc_usec_t now);
 
 #endif

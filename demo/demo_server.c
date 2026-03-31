@@ -68,6 +68,9 @@ typedef struct xqc_demo_svr_net_config_s {
 
     /* idle persist timeout */
     int     conn_timeout;
+
+    /* enable ML-assisted CUBIC */
+    int     cubic_use_ml;
 } xqc_demo_svr_net_config_t;
 
 
@@ -1441,6 +1444,7 @@ xqc_demo_svr_usage(int argc, char *argv[])
             "   -j    Bandwidth report interval in seconds (default: 1, 0 to disable)\n"
             "   -J    iperf output file path (default: server_iperf_output.csv)\n"
             "   -T    Transfer duration in seconds (default: unlimited)\n"
+            "   -U    Enable ML-assisted CUBIC (requires -c c)\n"
             , prog);
 }
 
@@ -1489,7 +1493,7 @@ void
 xqc_demo_svr_parse_args(int argc, char *argv[], xqc_demo_svr_args_t *args)
 {
     int ch = 0;
-    while ((ch = getopt(argc, argv, "p:c:CD:l:L:6k:rdMiPs:R:u:a:F:f:j:J:T:")) != -1) {
+    while ((ch = getopt(argc, argv, "p:c:CD:l:L:6k:rdMiPs:R:u:a:F:f:j:J:T:U:")) != -1) {
         switch (ch) {
         /* listen port */
         case 'p':
@@ -1635,6 +1639,12 @@ xqc_demo_svr_parse_args(int argc, char *argv[], xqc_demo_svr_args_t *args)
             args->env_cfg.transfer_duration = atoi(optarg);
             break;
 
+        /* enable ML-assisted CUBIC */
+        case 'U':
+            printf("option CUBIC ML enabled\n");
+            args->net_cfg.cubic_use_ml = 1;
+            break;
+
         default:
             printf("other option :%c\n", ch);
             xqc_demo_svr_usage(argc, argv);
@@ -1762,6 +1772,7 @@ xqc_demo_svr_init_conn_settings(xqc_engine_t *engine, xqc_demo_svr_args_t *args)
             .customize_on = 1,
             .init_cwnd = 32,
             .bbr_enable_lt_bw = 1,
+            .cubic_use_ml = args->net_cfg.cubic_use_ml,
         },
         .spurious_loss_detect_on = 1,
         .init_idle_time_out = 60000,

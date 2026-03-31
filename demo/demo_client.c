@@ -137,6 +137,9 @@ typedef struct xqc_demo_cli_net_config_s {
     uint8_t addr_specified;
     uint8_t port_specified;
 
+    /* enable ML-assisted CUBIC */
+    int     cubic_use_ml;
+
 } xqc_demo_cli_net_config_t;
 
 /**
@@ -1850,6 +1853,7 @@ xqc_demo_cli_init_conneciton_settings(xqc_conn_settings_t* settings,
     settings->cong_ctrl_callback = cong_ctrl;
     settings->cc_params.customize_on = 1,
     settings->cc_params.init_cwnd = 96,
+    settings->cc_params.cubic_use_ml = args->net_cfg.cubic_use_ml,
     settings->so_sndbuf = 1024*1024;
     settings->proto_version = args->quic_cfg.quic_version;
     settings->spurious_loss_detect_on = 1;
@@ -2076,6 +2080,7 @@ xqc_demo_cli_usage(int argc, char *argv[])
         "   -5    use X25519 group as the first choice\n"
         "   -j    Bandwidth report interval in seconds (default: 1, 0 to disable)\n"
         "   -J    iperf output file path (default: client_iperf_output.csv)\n"
+        "   -X    Enable ML-assisted CUBIC (requires -c c)\n"
         , prog);
 }
 
@@ -2083,7 +2088,7 @@ void
 xqc_demo_cli_parse_args(int argc, char *argv[], xqc_demo_cli_client_args_t *args)
 {
     int ch = 0;
-    while ((ch = getopt(argc, argv, "a:p:c:Ct:S:0m:A:D:l:L:k:K:U:u:dMoi:w:Ps:b:Z:NQT:R:V:B:I:n:e:E:F:G:r:x:y:Y:f:z:q65Oj:J:")) != -1) {
+    while ((ch = getopt(argc, argv, "a:p:c:Ct:S:0m:A:D:l:L:k:K:U:u:dMoi:w:Ps:b:Z:NQT:R:V:B:I:n:e:E:F:G:r:x:y:Y:f:z:q65Oj:J:X:")) != -1) {
         switch (ch) {
         /* server ip */
         case '6':
@@ -2392,6 +2397,12 @@ xqc_demo_cli_parse_args(int argc, char *argv[], xqc_demo_cli_client_args_t *args
         case 'J':
             printf("iperf output file: %s\n", optarg);
             strncpy(args->env_cfg.iperf_output_file, optarg, sizeof(args->env_cfg.iperf_output_file) - 1);
+            break;
+
+        /* enable ML-assisted CUBIC */
+        case 'X':
+            printf("option CUBIC ML enabled\n");
+            args->net_cfg.cubic_use_ml = 1;
             break;
 
         default:

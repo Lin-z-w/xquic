@@ -27,6 +27,10 @@
 #include "src/transport/xqc_reinjection.h"
 #include "src/transport/xqc_packet_out.h"
 
+#ifdef XQC_ENABLE_ML_CC
+#include "src/congestion_control/xqc_ml_model.h"
+#endif
+
 #define XQC_DEFAULT_TOKEN_KEY       "xquic token key"
 extern const xqc_qpack_ins_cb_t xqc_h3_qpack_ins_cb;
 
@@ -533,6 +537,10 @@ xqc_engine_create(xqc_engine_type_t engine_type,
 
     engine->default_conn_settings = internal_default_conn_settings;
 
+#ifdef XQC_ENABLE_ML_CC
+    xqc_ml_model_global_init();
+#endif
+
     return engine;
 
 fail:
@@ -637,6 +645,10 @@ xqc_engine_destroy(xqc_engine_t *engine)
     }
 
     xqc_free(engine);
+
+#ifdef XQC_ENABLE_ML_CC
+    xqc_ml_model_global_cleanup();
+#endif
 }
 
 
